@@ -26,8 +26,10 @@ The table's rows:
   difference of cumulative sums (the spectrum spans ~18 decades).
 - Cosmic: a fixed reference sample's tracks (cosmic_reference.py), flat in
   momentum over 100-110 MeV/c and scaled to the window's width, as the macro
-  treats them. Normalized so the loose set-81 selection gives anakit's loose
-  cosmic rate (approx_ce_sensitivity.recommended_cosmic_rate("box")).
+  treats them. Each track stands for (on-spill time / the reference's CRY
+  livetime) run tracks; a reference without a livetime is instead normalized
+  so the loose set-81 selection gives anakit's loose cosmic rate
+  (approx_ce_sensitivity.recommended_cosmic_rate("box")).
 
 The momentum window and the cuts alternate: the window is chosen for the
 seed cuts, the cuts for that window, the window again for the cuts, and the
