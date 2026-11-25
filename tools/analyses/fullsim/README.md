@@ -18,12 +18,10 @@ computed.
 | `provenance.py` | events generated to make a file: `dh.gencount` of its nearest SAM ancestor that has one (`generated_events`, or `generated_events_bulk` for many files); the first-generation file it descends from (`root_ancestor`) |
 | `cosmics.py` | the fixed-cut cosmic background: the cosmic mix matching the inputs (`cosmic_datasets_for`), its livetime (S2 events from SAM x the S1 livetime per event, `S1_LIVETIME_PER_EVENT`; `read_s1_livetime` measures it for a new S1 sample), which events count (`cosmic_counts`) and the spectrum the scan sees (`cosmic_spectrum`) |
 | `tune.py` | the optimize mode's table: the preselection's first track per event, the tuned variables, signal and per-event DIO weights in 0.1 MeV bins, the cosmic rows; the momentum-window scan and the window/cut alternation. The cut search is the shared optimizer `tools/analyses/optimize.py` (M. MacKenzie's port of `optimize_selection_fast.C`, also behind `optimize_selection_ntuple`); `tune.py` converts its cuts to and from that optimizer's `CutVar`s |
-| `cosmic_reference.py` | the fixed cosmic reference table the optimize mode reads (`data/fullsim_cosmic_reference.npz`, made by `scripts/make_fullsim_cosmic_reference.py`), and its normalization by its CRY livetime |
 | `cuts.py` | pyfitter's `Analyze.define_cuts` with `run1a_tsda`'s thresholds (`CUT_SETS`, which holds only it), as track-level masks (`cut_masks`), its default cuts and time window, toggling by name, and the cut flow |
 
 The window scan and DIO spectrum are imported from `approx_ce_sensitivity`,
-as are the flat cosmic rate `cosmic_source` `rate` falls back to and the
-loose rate the optimize mode's cosmic reference is normalized to. The signal and DIO normalization is Production's:
+as is the flat cosmic rate `cosmic_source` `rate` falls back to. The signal and DIO normalization is Production's:
 counts for the stopped mu- NPOT gives (`normalization.py`).
 
 ## Setup
@@ -166,9 +164,8 @@ the selection is also tuned on the inputs:
 - **Preselection**: the active cuts' vetoes and requirements (trigger,
   upstream and multi-track vetoes, a calorimeter cluster, no OPA, no TSDA,
   CRV), as `enable_cuts` and `disable_cuts` leave them, and the time window,
-  fixed. The reference can follow only `no_opa`, `no_tsda` and `no_crv_veto`
-  beyond the loose set 81 it was cut to, so dropping a set-81 cut or adding
-  any other is an error in this mode. The stopping-target cuts are dropped, as in
+  fixed. The cosmic mix passes the same preselection, so any of them can be
+  kept or dropped. The stopping-target cuts are dropped, as in
   M. MacKenzie's `optimize_target_selection_fast`: they assume the standard
   target. The time window is not tuned: it stands against radiative pion
   captures and the beam flash, which this background model does not hold.
@@ -180,21 +177,18 @@ the selection is also tuned on the inputs:
   electron: its DIO weight is the theory spectrum integrated over the true
   energies that land in the window. Summed over events this is the fixed
   mode's folded DIO; per event it passes or fails the cuts with its CE.
-- **Cosmics**: a fixed reference sample (`cosmic_reference`), flat over
-  100-110 MeV/c and scaled to the window. Each track stands for (on-spill
-  time / the reference's CRY livetime) run tracks, the livetime counted as
-  for the fixed mode's cosmic mix: the S2 events behind the reference's
-  `dts.mu2e.CosmicSignal` inputs (their SAM `dh.gencount`; the inputs come
-  from the jobs' logs, since the ntuples are not in SAM) times the S1
-  livetime per event. The committed reference is 498 jobs x 10 inputs x 5e6
-  S2 events = 2.49e10, 5.70e6 s. A sidecar without `livetime_s` falls back
-  to the old normalization, the loose set-81 selection's true electrons
-  giving the loose cosmic rate `approx_ce_sensitivity` uses in box mode
-  (`opt_cosmic_livetime_s` is then -1); for the committed reference that
-  weight is 8% below the livetime one. Every species is kept at that
-  same weight: about a third of the loose tracks are muons, and without them
-  the search would drop TrkPID for free (it did, before they were kept: the
-  tuned cuts passed 116 reference muons, against 2 now).
+- **Cosmics**: the official cosmic mix nts the fixed mode measures on
+  (`cosmic_source`, by default the `CosmicSignalMix1BB` matching the inputs),
+  read once for both modes: each file's first preselected track per event,
+  kept where a cosmic made it, in the time window and 100-110 MeV/c, flat
+  over that range and scaled to the window. Each track stands for (on-spill
+  time / the sample's CRY livetime) run tracks, the livetime being the fixed
+  mode's (S2 events from SAM x the S1 livetime per event). The mix is
+  reconstructed with the inputs' own code, conditions and pileup, so its
+  TrkQual, TrkPID, N(active) and t0err match the CE rows'. Every species is
+  kept at that same weight: about a third of the loose tracks are muons,
+  and without them the search would drop TrkPID for free. Optimize mode
+  needs the mix: `cosmic_source` `rate` is an error in it.
 - **Search**: the shared optimizer (`tools/analyses/optimize.py`, as
   `optimize_selection_ntuple`): the macro's greedy path and five randomized
   paths from no cut, the cut set and the previous round as further starts,
@@ -211,36 +205,12 @@ the selection is also tuned on the inputs:
 | `opt_window_*_mevc`, `opt_seed_window_*_mevc` | the momentum windows |
 | `opt_cut_<var>_low`, `opt_cut_<var>_high` | the tuned cuts; an edge never placed (no cut there) is NaN |
 | `opt_n_ce_rows`, `opt_n_cosmic_rows` | CE and cosmic rows of the table |
-| `opt_cosmic_livetime_s` | the cosmic reference's CRY livetime (s); -1 for a reference normalized to the loose rate |
+| `opt_cosmic_livetime_s` | the cosmic sample's CRY livetime (s), as `cosmic_livetime_s` |
 
 The search was checked against the macro itself: on the macro's own
 in-memory table for `st37plus6up6dn` (dumped from it), the port finds S/sqrt(B)
 2.296 (train) and 2.443 (test) against the macro's 2.299 and 2.451, with the
 same cuts within their flat directions.
-
-The reference must be reconstructed with the same code and conditions as the
-inputs (TrkQual and TrkPID are MVAs that change between releases). Nothing
-checks this. The committed one (`data/fullsim_cosmic_reference.npz`) is
-reconstructed primary-only, without pileup, with
-`Code_ana_v020301_fcl_mdc2025bc`. For inputs mixed with pileup (Mix1BB) or
-from another release, its TrkQual, N(active) and t0err are measured without
-the pileup hits the CE rows carry, so the tuned cuts are approximate. Make a
-matching reference for those inputs. Make it
-from the CRY signal-region cosmics, `dts.mu2e.CosmicSignal.MDC2025ap.art`,
-run through the inputs' own reconstruction, then:
-
-```bash
-python3 scripts/make_fullsim_cosmic_reference.py --files 'nts.*.root' \
-    --reco '<code tarball, conditions, run>' --out data/fullsim_cosmic_reference.npz
-```
-
-Each ntuple's directory must hold its job's `log.*.log` (as a jobsub
-outstage does): the script reads the dts inputs from it and their
-`dh.gencount` from SAM, and records the livetime and the ntuple list. A job
-that did not finish, or an input read twice, is refused.
-`--add-livetime` adds the livetime to an existing sidecar without reducing
-the ntuples again. Its sidecar `.json` records how; every optimized result
-reports it.
 
 ### Stopped muons per POT for another campaign
 

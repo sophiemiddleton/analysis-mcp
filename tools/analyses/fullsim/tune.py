@@ -24,12 +24,12 @@ The table's rows:
   assumption as approx_ce_sensitivity's box mode). The integral is taken per
   0.1 MeV bin of reconstructed momentum and a window sums its bins, never a
   difference of cumulative sums (the spectrum spans ~18 decades).
-- Cosmic: a fixed reference sample's tracks (cosmic_reference.py), flat in
-  momentum over 100-110 MeV/c and scaled to the window's width, as the macro
-  treats them. Each track stands for (on-spill time / the reference's CRY
-  livetime) run tracks; a reference without a livetime is instead normalized
-  so the loose set-81 selection gives anakit's loose cosmic rate
-  (approx_ce_sensitivity.recommended_cosmic_rate("box")).
+- Cosmic: the official cosmic mix's tracks (the nts sample the fixed-cut
+  mode measures on, sensitivity.measure_cosmics), the first preselected
+  track of each event whose track a cosmic made, of every species, flat in
+  momentum over 100-110 MeV/c and scaled to the window's width, as the
+  macro treats them. Each track stands for (on-spill time / the sample's
+  CRY livetime) run tracks.
 
 The momentum window and the cuts alternate: the window is chosen for the
 seed cuts, the cuts for that window, the window again for the cuts, and the
@@ -46,24 +46,13 @@ import numpy as np
 
 from .. import optimize as op
 from .cuts import CUT_ORDER, cut_masks, default_cuts, get_cut_set
-from .eventntuple import SID_TT_FRONT, SID_TT_MID, origin_codes
+from .eventntuple import ORIGIN_COSMIC, SID_TT_FRONT, SID_TT_MID, origin_codes
 
 # Cuts the search replaces with its own (the tuned variables), and the
 # stopping-target cuts it drops.
 TUNED_CUTS = ("pz_over_pt", "within_d0", "good_trkpid", "good_trkqual",
               "has_hits", "within_t0err")
 ST_CUTS = ("st_boundary", "has_st")
-# Set 81, the loose selection anakit's loose cosmic rate is defined for.
-LOOSE_CUTS = ("has_a_track", "is_good_track", "has_trk_front_seg",
-              "is_reco_electron_or_positron", "has_downstream",
-              "charge_selection", "or_trigger", "upstream_veto",
-              "no_multi_trk_veto")
-# Cuts in the preselection beyond the loose set, kept as flags on the cosmic
-# reference so it is built once for any preselection.
-EXTRA_PRESELECTION = ("no_opa", "no_tsda", "no_crv_veto")
-# The calorimeter-cluster requirement (good_trkpid's event part, which the
-# macro applies as trk_cluster > 0), also a flag on the reference.
-CALO_FLAG = "has_calo"
 
 # The tuned variables and their search ranges (the macro's, widened where
 # the cut set's seed sits near an edge). Not t0: the time window stands
@@ -148,25 +137,9 @@ def preselection(cut_set: str) -> tuple:
 
 def optimize_preselection(active) -> tuple:
     """The active cuts (enable_cuts and disable_cuts applied) less the tuned
-    and stopping-target ones. The cosmic reference applies LOOSE_CUTS and
-    carries EXTRA_PRESELECTION as flags, nothing else, so a preselection
-    outside that would cut the CE and the cosmics differently: refused."""
+    and stopping-target ones; the CE and the cosmic mix both pass them."""
     drop = set(TUNED_CUTS) | set(ST_CUTS)
-    pre = tuple(n for n in active if n not in drop)
-    missing = [n for n in LOOSE_CUTS if n not in pre]
-    if missing:
-        raise TuneError(
-            f"disable_cuts removes {', '.join(missing)}, which the cosmic "
-            "reference always applies (it holds only tracks passing set 81): "
-            "keep them in optimize mode")
-    unknown = [n for n in pre if n not in LOOSE_CUTS + EXTRA_PRESELECTION]
-    if unknown:
-        raise TuneError(
-            f"enable_cuts adds {', '.join(unknown)}, which the cosmic reference "
-            "has no flag for (it can follow only "
-            f"{', '.join(EXTRA_PRESELECTION)} beyond set 81; the momentum and "
-            "time windows are the scan and time_window): drop them in optimize mode")
-    return pre
+    return tuple(n for n in active if n not in drop)
 
 
 def candidate_tracks(data: dict, cuts: tuple, triggers, cut_set: str,
@@ -246,6 +219,26 @@ def in_time(tracks: dict, time_window) -> dict:
     return {k: v[keep] for k, v in tracks.items()}
 
 
+def cosmic_rows(tracks: dict, time_window, onspill_seconds: float,
+                livetime_s: float) -> tuple[dict, float]:
+    """The cosmic mix's candidate tracks (candidate_tracks) that a cosmic
+    made, in the time window and the flat range, and the weight each carries
+    per MeV/c of window: (on-spill time / the sample's livetime), spread
+    flat over the range. Every species is kept: the tuned cuts must still
+    reject the muons (about a third), TrkPID above all, and rows without
+    them let the search drop that cut for free."""
+    if livetime_s <= 0:
+        raise TuneError(f"the cosmic sample's livetime is {livetime_s:g} s")
+    p = tracks["p"]
+    keep = ((tracks["origin"] == ORIGIN_COSMIC) & np.isfinite(p)
+            & (p > COSMIC_FLAT_MEV[0]) & (p < COSMIC_FLAT_MEV[1]))
+    for name in VARIABLE_NAMES:
+        keep &= np.isfinite(tracks[name])
+    rows = in_time({k: v[keep] for k, v in tracks.items()}, time_window)
+    per_mev = onspill_seconds / livetime_s / (COSMIC_FLAT_MEV[1] - COSMIC_FLAT_MEV[0])
+    return rows, per_mev
+
+
 def combine_tracks(parts: list) -> dict:
     keys = parts[0].keys()
     return {k: np.concatenate([p[k] for p in parts]) for k in keys}
@@ -316,8 +309,7 @@ class Rows:
 def build_rows(ce: dict, cosmic: dict, *, signal_per_event: float,
                dio_per_event: float, cosmic_per_mev_per_row: float,
                dio_density) -> Rows:
-    """CE rows (true CE with finite momenta) and cosmic rows (the reference
-    tracks passing the preselection, 100-110 MeV/c)."""
+    """CE rows (true CE with finite momenta) and cosmic rows (cosmic_rows)."""
     edges = p_edges()
     p, p_true = ce["p"], ce["p_true"]
     delta = p - p_true

@@ -6565,10 +6565,10 @@ def test_optimize_selection_ntuple_registered():
     assert spec.units  # units are declared
 
 
-# --- fullsim cut_mode="optimize" (tune.py on optimize.py, cosmic_reference.py) ---
+# --- fullsim cut_mode="optimize" (tune.py on optimize.py) ---
 
 from tools.analyses.fullsim import tune as fs_tune
-from tools.analyses.fullsim import cosmic_reference as fs_ref
+from tools.analyses.fullsim.eventntuple import ORIGIN_COSMIC as FS_ORIGIN_COSMIC
 
 
 def _toy_rows(seed=1, ns=3000, nb=12000):
@@ -6660,69 +6660,40 @@ def test_fullsim_dio_weights_integrate_the_spectrum_per_bin():
     assert (w >= 0).all()
 
 
-def test_fullsim_cosmic_reference_normalizes_to_the_loose_rate(tmp_dir):
-    n = 40
-    rows = {name: np.full(n, 0.5) for name in fs_tune.VARIABLE_NAMES}
-    rows.update({"t0": np.full(n, 900.0), "p": np.linspace(96, 114, n),
-                 "event": np.arange(n), "mc_pdg": np.where(np.arange(n) % 4 == 0, 13, 11),
-                 "has_calo": np.ones(n, bool), "no_opa": np.ones(n, bool),
-                 "no_tsda": np.arange(n) % 2 == 0, "no_crv_veto": np.ones(n, bool)})
-    path = Path(tmp_dir) / "ref.npz"
-    fs_ref.save(path, rows, {"dataset": "test", "reco": "test"})
-    loaded, meta = fs_ref.load(path)
-    assert meta["n_normalizing"] == fs_ref.normalizing_count(rows) > 0
-    kept, per_mev = fs_ref.rows_for(loaded, ("no_tsda",), 2.0, 3.0)
-    # rate x time over the normalizing count, per MeV of window
-    assert np.isclose(per_mev * meta["n_normalizing"], 2.0 * 3.0)
-    # every species is kept (the muons must meet the tuned cuts too); only
-    # the electrons normalize
-    assert set(np.abs(kept["mc_pdg"])) == {11, 13} and kept["no_tsda"].all()
-    flat = (rows["p"] > 100) & (rows["p"] < 110) & rows["no_tsda"]
-    assert kept["p"].size == int(flat.sum())
-    try:
-        fs_ref.load(Path(tmp_dir) / "missing.npz")
-    except fs_ref.ReferenceError as exc:
-        assert "make_fullsim_cosmic_reference" in str(exc)
-    else:
-        raise AssertionError("a missing reference was accepted")
+def _toy_cosmic_tracks(n, rng, origin=None, mc_pdg=None):
+    """Candidate tracks of a cosmic mix, spread over the tuned variables."""
+    return {"cos": rng.uniform(0.3, 0.9, n), "t0": rng.uniform(450, 1700, n),
+            "rmax": rng.uniform(350, 700, n), "d0": rng.uniform(-200, 200, n),
+            "trkqual": rng.uniform(0, 1, n), "trkpid": rng.uniform(0, 1, n),
+            "t0err": rng.uniform(0.3, 2, n), "nactive": rng.integers(10, 60, n).astype(float),
+            "p": rng.uniform(96, 114, n), "event": np.arange(n),
+            "origin": np.full(n, FS_ORIGIN_COSMIC) if origin is None else origin,
+            "mc_pdg": np.full(n, 11) if mc_pdg is None else mc_pdg,
+            "has_calo": np.ones(n, bool)}
 
 
-def test_fullsim_cosmic_reference_with_a_livetime_weighs_each_track_by_it(tmp_dir):
-    n = 40
-    rows = {name: np.full(n, 0.5) for name in fs_tune.VARIABLE_NAMES}
-    rows.update({"t0": np.full(n, 900.0), "p": np.linspace(96, 114, n),
-                 "event": np.arange(n), "mc_pdg": np.where(np.arange(n) % 4 == 0, 13, 11),
-                 "has_calo": np.ones(n, bool), "no_opa": np.ones(n, bool),
-                 "no_tsda": np.ones(n, bool), "no_crv_veto": np.ones(n, bool)})
-    # the jobs' inputs: two dts files each, 5M S2 events per file
-    log = ('Opened input file "xroot://x//pnfs/a/dts.mu2e.CosmicSignal.MDC2025ap.001430_00000001.art"\n'
-           'Opened input file "/pnfs/b/dts.mu2e.CosmicSignal.MDC2025ap.001430_00000002.art"\n'
-           + fs_ref.ART_COMPLETED + ".\n")
-    inputs = fs_ref.inputs_from_log(log)
-    assert inputs == ["dts.mu2e.CosmicSignal.MDC2025ap.001430_00000001.art",
-                      "dts.mu2e.CosmicSignal.MDC2025ap.001430_00000002.art"]
-    gencounts = {name: 5_000_000 for name in inputs}
-    meta = fs_ref.add_livetime({"dataset": "test"}, inputs, gencounts, "s1.art", 2.0e-4)
-    assert meta["s2_events"] == 10_000_000 and np.isclose(meta["livetime_s"], 2000.0)
-    path = Path(tmp_dir) / "ref.npz"
-    fs_ref.save(path, rows, meta)
-    loaded, loaded_meta = fs_ref.load(path)
-    assert np.isclose(loaded_meta["livetime_s"], 2000.0)
-    kept, per_mev = fs_ref.rows_for(loaded, (), 99.0, 300.0, loaded_meta["livetime_s"])
-    # on-spill time over livetime, spread flat over 100-110 MeV/c; the loose
-    # rate (99) and the electron count play no part
+def test_fullsim_cosmic_rows_keep_cosmics_in_range_and_time_weighted_by_livetime():
+    rng = np.random.default_rng(3)
+    n = 400
+    origin = np.where(np.arange(n) % 5 == 0, 166, FS_ORIGIN_COSMIC)   # some pileup DIO
+    pdg = np.where(np.arange(n) % 3 == 0, 13, 11)
+    tracks = _toy_cosmic_tracks(n, rng, origin, pdg)
+    tracks["t0err"][1] = np.nan
+    rows, per_mev = fs_tune.cosmic_rows(tracks, (540.0, 1650.0), 300.0, 2000.0)
+    # on-spill time over livetime, spread flat over 100-110 MeV/c
     assert np.isclose(per_mev, 300.0 / 2000.0 / 10.0)
-    assert set(np.abs(kept["mc_pdg"])) == {11, 13}
-    # an unfinished job, an input read twice, an input SAM has no count for
-    for bad in (lambda: fs_ref.inputs_from_log(log.replace(fs_ref.ART_COMPLETED, "")),
-                lambda: fs_ref.add_livetime({}, inputs + inputs[:1], gencounts, "s1", 1.0),
-                lambda: fs_ref.add_livetime({}, inputs + ["other.art"], gencounts, "s1", 1.0)):
-        try:
-            bad()
-        except fs_ref.ReferenceError:
-            pass
-        else:
-            raise AssertionError("a bad livetime input was accepted")
+    want = ((origin == FS_ORIGIN_COSMIC) & (tracks["p"] > 100) & (tracks["p"] < 110)
+            & (tracks["t0"] > 540) & (tracks["t0"] < 1650) & np.isfinite(tracks["t0err"]))
+    assert rows["p"].size == int(want.sum()) > 0
+    assert (rows["origin"] == FS_ORIGIN_COSMIC).all()
+    # every species is kept: the muons must meet the tuned cuts too
+    assert set(np.abs(rows["mc_pdg"])) == {11, 13}
+    try:
+        fs_tune.cosmic_rows(tracks, (540.0, 1650.0), 300.0, 0.0)
+    except fs_tune.TuneError as exc:
+        assert "livetime" in str(exc)
+    else:
+        raise AssertionError("a zero livetime was accepted")
 
 
 def test_fullsim_seed_is_the_cut_set_without_the_target_cuts():
@@ -6740,66 +6711,69 @@ def test_fullsim_optimize_mode_runs_and_fixed_mode_reports_minus_one(tmp_dir):
         print("     (skipped: CE mix file not on disk)")
         return
     from tools.analyses.fullsim import normalization as norm
-    base = {"n_generated": 20000, "stopped_muons_per_pot": norm.STOPPED_MUONS_PER_POT,
-            "cosmic_source": "rate"}
-    fixed = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
-                         output_dir=tmp_dir, parameters=base)
-    assert fixed.status == "success" and fixed.metadata["opt_punzi_test"] == -1.0
-    # a reference of cosmics spread over the tuned variables
+    base = {"n_generated": 20000, "stopped_muons_per_pot": norm.STOPPED_MUONS_PER_POT}
+    # optimize reads the cosmic mix through measure_cosmics; stand in for it
+    # (no SAM) with toy cosmic tracks and a flat count
     rng = np.random.default_rng(5)
-    n = 400
-    rows = {"cos": rng.uniform(0.3, 0.9, n), "t0": rng.uniform(450, 1700, n),
-            "rmax": rng.uniform(350, 700, n), "d0": rng.uniform(-200, 200, n),
-            "trkqual": rng.uniform(0, 1, n), "trkpid": rng.uniform(0, 1, n),
-            "t0err": rng.uniform(0.3, 2, n), "nactive": rng.integers(10, 60, n).astype(float),
-            "p": rng.uniform(100, 110, n), "event": np.arange(n), "mc_pdg": np.full(n, 11),
-            "has_calo": np.ones(n, bool), "no_opa": np.ones(n, bool),
-            "no_tsda": np.ones(n, bool), "no_crv_veto": np.ones(n, bool)}
-    ref = Path(tmp_dir) / "ref.npz"
-    fs_ref.save(ref, rows, {"dataset": "toy", "reco": "toy"})
-    r = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
-                     output_dir=tmp_dir, parameters={**base, "cut_mode": "optimize",
-                                                     "cosmic_reference": str(ref)})
-    assert r.status == "success", r.message
-    m = r.metadata
-    # the fixed result is reported unchanged alongside
-    assert m["sensitivity"] == fixed.metadata["sensitivity"]
-    assert m["opt_punzi_test"] > 0 and m["opt_seed_punzi_test"] > 0
-    assert np.isclose(m["opt_gain_test"], m["opt_punzi_test"] / m["opt_seed_punzi_test"])
-    # trkqual is cut from below only: its upper edge is never placed (NaN,
-    # never a range end that could read as NOT_OPTIMIZED)
-    assert m["opt_n_cosmic_rows"] > 0 and np.isnan(m["opt_cut_trkqual_high"])
-    assert 100.0 <= m["opt_window_low_mevc"] < m["opt_window_high_mevc"] <= 106.0
-    # a reference without a livetime normalizes to the loose rate, and says so
-    assert m["opt_cosmic_livetime_s"] == -1.0
-    assert fixed.metadata["opt_cosmic_livetime_s"] == -1.0
-    # with one, every cosmic weight scales as 1 / livetime
-    timed = Path(tmp_dir) / "timed.npz"
-    fs_ref.save(timed, rows, {"dataset": "toy", "reco": "toy", "livetime_s": 1.0e5})
-    lt = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
-                      output_dir=tmp_dir, parameters={**base, "cut_mode": "optimize",
-                                                      "cosmic_reference": str(timed)})
-    assert lt.status == "success", lt.message
-    assert lt.metadata["opt_cosmic_livetime_s"] == 1.0e5
-    assert lt.metadata["opt_seed_background_test"] != m["opt_seed_background_test"]
+    toy = _toy_cosmic_tracks(400, rng)
+    seen = {}
+
+    def fake(params, names, active, triggers, time_window, onspill, tq, tp, cut_set,
+             presel=None):
+        seen["presel"] = presel
+        lt = fake.livetime
+        return {"dataset": "toy.cosmics", "n_files": 1, "s1_file": "s1.art",
+                "livetime_per_event": 1.0, "s2_events": lt, "livetime": lt,
+                "weight": onspill / lt, "n_counted": 5, "n_flat_range": 5,
+                "upper_limit": 0.0, "shape": "flat",
+                "ev": {"n_events": 400, "origin": np.zeros(0), "p": np.zeros(0),
+                       "t": np.zeros(0)},
+                "rate_per_mev": 5 * onspill / lt / 10, "values": None,
+                "candidates": None if presel is None else toy}
+    fake.livetime = 1.0e5
+    original = fs_sens.measure_cosmics
+    fs_sens.measure_cosmics = fake
+    try:
+        fixed = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
+                             output_dir=tmp_dir, parameters=base)
+        assert fixed.status == "success" and fixed.metadata["opt_punzi_test"] == -1.0
+        assert fixed.metadata["opt_cosmic_livetime_s"] == -1.0 and seen["presel"] is None
+        r = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
+                         output_dir=tmp_dir, parameters={**base, "cut_mode": "optimize"})
+        assert r.status == "success", r.message
+        m = r.metadata
+        # the cosmic files are read with the preselection, once
+        assert seen["presel"] and "has_st" not in seen["presel"]
+        # the fixed result is reported unchanged alongside
+        assert m["sensitivity"] == fixed.metadata["sensitivity"]
+        assert m["opt_punzi_test"] > 0 and m["opt_seed_punzi_test"] > 0
+        assert np.isclose(m["opt_gain_test"], m["opt_punzi_test"] / m["opt_seed_punzi_test"])
+        # trkqual is cut from below only: its upper edge is never placed (NaN,
+        # never a range end that could read as NOT_OPTIMIZED)
+        assert m["opt_n_cosmic_rows"] > 0 and np.isnan(m["opt_cut_trkqual_high"])
+        assert 100.0 <= m["opt_window_low_mevc"] < m["opt_window_high_mevc"] <= 106.0
+        assert m["opt_cosmic_livetime_s"] == 1.0e5
+        # every cosmic weight scales as 1 / livetime
+        fake.livetime = 2.0e5
+        lt = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
+                          output_dir=tmp_dir, parameters={**base, "cut_mode": "optimize"})
+        assert lt.status == "success", lt.message
+        assert lt.metadata["opt_cosmic_livetime_s"] == 2.0e5
+        assert lt.metadata["opt_seed_background_test"] < m["opt_seed_background_test"]
+        fake.livetime = 1.0e5
+        # the preselection follows disable_cuts (CE and cosmics alike)
+        r = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
+                         output_dir=tmp_dir, parameters={**base, "cut_mode": "optimize",
+                                                         "disable_cuts": "no_tsda"})
+        assert r.status == "success", r.message
+        assert "no_tsda" not in seen["presel"]
+    finally:
+        fs_sens.measure_cosmics = original
+    # optimize needs the cosmic mix: the flat rate is refused before any read
     bad = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
                        output_dir=tmp_dir, parameters={**base, "cut_mode": "optimize",
-                                                       "cosmic_reference": str(Path(tmp_dir) / "none.npz")})
-    assert bad.status == "error" and "cosmic reference" in bad.message
-    # the preselection follows disable_cuts (CE and cosmics alike) ...
-    r = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
-                     output_dir=tmp_dir, parameters={**base, "cut_mode": "optimize",
-                                                     "cosmic_reference": str(ref),
-                                                     "disable_cuts": "no_tsda"})
-    assert r.status == "success", r.message
-    assert "no_tsda" not in r.metadata.get("optimize", {}).get("preselection", [])
-    # ... and a cut the reference cannot follow is a plain error
-    for cut_params in ({"disable_cuts": "upstream_veto"}, {"enable_cuts": "in_mom_range"}):
-        bad = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
-                           output_dir=tmp_dir, parameters={**base, "cut_mode": "optimize",
-                                                           "cosmic_reference": str(ref),
-                                                           **cut_params})
-        assert bad.status == "error" and "optimize" in bad.message, bad.message
+                                                       "cosmic_source": "rate"})
+    assert bad.status == "error" and "cosmic_source" in bad.message, bad.message
 
 
 def test_fullsim_optimize_preselection_follows_the_active_cuts():
@@ -6808,14 +6782,9 @@ def test_fullsim_optimize_preselection_follows_the_active_cuts():
     assert "no_tsda" not in pre and "no_opa" in pre and "has_st" not in pre
     assert fs_tune.optimize_preselection(fs_cuts.default_cuts("run1a_tsda")) \
         == fs_tune.preselection("run1a_tsda")
-    for enable, disable, word in (("", "upstream_veto", "upstream_veto"),
-                                  ("in_mom_range", "", "in_mom_range")):
-        try:
-            fs_tune.optimize_preselection(fs_cuts.active_cuts(enable, disable, "run1a_tsda"))
-        except fs_tune.TuneError as exc:
-            assert word in str(exc)
-        else:
-            raise AssertionError(f"{word} was accepted in optimize mode")
+    # any vetoes may be kept or dropped: the cosmics pass the same ones
+    pre = fs_tune.optimize_preselection(fs_cuts.active_cuts("", "upstream_veto", "run1a_tsda"))
+    assert "upstream_veto" not in pre and "no_opa" in pre
 
 
 def test_fullsim_seed_has_run1a_d0_cut():
@@ -6843,10 +6812,8 @@ def test_fullsim_tuned_trkpid_stays_closed_against_cosmic_muons():
         table(n_mu, rng.uniform(-1.0, 0.3, n_mu)).values())}
     ref.update(p=rng.uniform(100, 110, n_e + n_mu), event=np.arange(n_e + n_mu),
                mc_pdg=np.r_[np.full(n_e, 11), np.full(n_mu, 13)],
-               has_calo=np.ones(n_e + n_mu, bool))
-    for flag in fs_tune.EXTRA_PRESELECTION:
-        ref[flag] = np.ones(n_e + n_mu, bool)
-    cosmic, per_mev = fs_ref.rows_for(ref, (), 1.0, 1.0)
+               origin=np.full(n_e + n_mu, FS_ORIGIN_COSMIC))
+    cosmic, per_mev = fs_tune.cosmic_rows(ref, (540.0, 1650.0), 1.0, 30.0)
     assert (np.abs(cosmic["mc_pdg"]) == 13).sum() > 0
     rows = fs_tune.build_rows(ce, cosmic, signal_per_event=5.0 / n_ce,
                               dio_per_event=0.0, cosmic_per_mev_per_row=per_mev * 50,

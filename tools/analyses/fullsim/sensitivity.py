@@ -38,9 +38,8 @@ files) instead of from EdepAna's truth-level tree:
    resampled, from SAM, times the S1 livetime per event), spread flat over
    the momentum axis at the count in 100-110 MeV/c by default. With
    cosmic_source 'rate', flat at `cosmic_rate_per_s_per_mev` instead, as
-   approx_ce_sensitivity has it. (cut_mode="optimize" tunes against its
-   own cosmic reference, normalized by that reference's CRY livetime the
-   same way; the loose fast-sim rate only for a sidecar without one.)
+   approx_ce_sensitivity has it. (cut_mode="optimize" tunes against the
+   same cosmic mix's tracks, weighted the same way, so it needs the mix.)
 5. Scan every momentum window with approx_ce_sensitivity's scan_signal_box
    and keep the one maximizing S/sqrt(B).
 """
@@ -58,7 +57,7 @@ from ..approx_ce_sensitivity import (COSMIC_RATE_PER_SECOND_PER_MEV,
                                      MEAN_POT_PER_EVENT, NPOT,
                                      ONSPILL_SECONDS_PER_EVENT, SIGNAL_REBIN,
                                      SensitivityError, load_dio_spectrum,
-                                     recommended_cosmic_rate, scan_signal_box)
+                                     scan_signal_box)
 from .cuts import (CUT_ORDER, CUT_SET, CUT_SETS, CutError, active_cuts,
                    apply_cuts, cut_descriptions, cut_masks, default_cuts,
                    get_cut_set)
@@ -72,7 +71,6 @@ from .normalization import (CAPTURES_PER_STOPPED_MUON, DIO_PER_STOPPED_MUON,
                             stopped_muons_per_pot)
 from .provenance import (ProvenanceError, generated_events,
                          generated_events_bulk, root_ancestor)
-from . import cosmic_reference
 from . import cosmics
 from . import tune
 
@@ -90,8 +88,7 @@ OPT_METRICS = (
     "opt_window_low_mevc", "opt_window_high_mevc",
     "opt_seed_window_low_mevc", "opt_seed_window_high_mevc",
     "opt_n_ce_rows", "opt_n_cosmic_rows",
-    # the cosmic reference's CRY livetime; -1 for a reference normalized
-    # to the loose rate (a sidecar without livetime_s)
+    # the cosmic sample's CRY livetime (as cosmic_livetime_s)
     "opt_cosmic_livetime_s",
     *(f"opt_cut_{v}_{edge}" for v in tune.VARIABLE_NAMES for edge in ("low", "high")),
 )
@@ -266,9 +263,10 @@ def build_spectra(p_reco: np.ndarray, p_true: np.ndarray, n_generated: int,
 # --- cut_mode="optimize" -----------------------------------------------------
 
 def _optimize_selection(candidates, cut_set, presel, time_window, n_generated,
-                        upstream_eff, spectra, rmue, reference_path):
-    """Tune the selection on the inputs' CE and the cosmic reference
-    (tune.py). Returns (tune.Tuned, opt_* metrics, extra)."""
+                        upstream_eff, spectra, rmue, cosmic):
+    """Tune the selection on the inputs' CE and the cosmic mix's tracks
+    (`cosmic`, measure_cosmics with the preselection; tune.py). Returns
+    (tune.Tuned, opt_* metrics, extra)."""
     ce = tune.combine_tracks(candidates)
     keep = (ce["origin"] == CE_ORIGIN) & np.isfinite(ce["p"]) & np.isfinite(ce["p_true"])
     for name in tune.VARIABLE_NAMES:
@@ -276,19 +274,13 @@ def _optimize_selection(candidates, cut_set, presel, time_window, n_generated,
     ce = tune.in_time({k: v[keep] for k, v in ce.items()}, time_window)
     if ce["p"].size == 0:
         raise tune.TuneError("no true CE passes the preselection in the time window")
-    rows, meta = cosmic_reference.load(reference_path)
-    flags = tuple(f for f in tune.EXTRA_PRESELECTION if f in presel)
-    rate = recommended_cosmic_rate("box")
-    livetime = float(meta.get("livetime_s") or 0.0)
-    cosmic, per_mev = cosmic_reference.rows_for(rows, flags, rate,
-                                                spectra["onspill_seconds"], livetime)
-    # the time window cuts the cosmics too; their weight is per track of the
-    # loose (untimed) selection, so dropping rows is the whole effect
-    cosmic = tune.in_time(cosmic, time_window)
+    livetime = float(cosmic["livetime"])
+    cosmic_tracks, per_mev = tune.cosmic_rows(cosmic["candidates"], time_window,
+                                              spectra["onspill_seconds"], livetime)
     per_event = upstream_eff / n_generated
     stopped = spectra["stopped_muons"]
     built = tune.build_rows(
-        ce, cosmic,
+        ce, cosmic_tracks,
         signal_per_event=stopped * CAPTURES_PER_STOPPED_MUON * rmue * per_event,
         dio_per_event=stopped * DIO_PER_STOPPED_MUON * per_event,
         cosmic_per_mev_per_row=per_mev, dio_density=load_dio_spectrum())
@@ -305,8 +297,8 @@ def _optimize_selection(candidates, cut_set, presel, time_window, n_generated,
         "opt_seed_signal_test": result.seed_test.signal,
         "opt_seed_background_test": result.seed_test.background,
         "opt_n_ce_rows": float(ce["p"].size),
-        "opt_n_cosmic_rows": float(cosmic["p"].size),
-        "opt_cosmic_livetime_s": livetime if livetime > 0 else NOT_OPTIMIZED,
+        "opt_n_cosmic_rows": float(cosmic_tracks["p"].size),
+        "opt_cosmic_livetime_s": livetime,
     }
     for key, window in (("opt_window", result.window), ("opt_seed_window", result.seed_window)):
         lo, hi = result.window_mev(window)
@@ -320,9 +312,9 @@ def _optimize_selection(candidates, cut_set, presel, time_window, n_generated,
              "seed_cuts": {k: [float(a), float(b)] for k, (a, b) in seed.items()},
              "preselection": list(presel),
              "time_window": [float(t) for t in time_window],
-             "cosmic_reference": meta,
-             # the loose rate only normalizes a reference without a livetime
-             "cosmic_rate_per_s_per_mev": None if livetime > 0 else rate,
+             "cosmic_sample": {"dataset": cosmic["dataset"], "n_files": cosmic["n_files"],
+                               "livetime_s": livetime, "s2_events": cosmic["s2_events"],
+                               "n_rows": int(cosmic_tracks["p"].size)},
              "rounds": [{"window": list(result.window_mev(r["window"])),
                          "fom_train": r["fom_train"]} for r in result.rounds]}
     return result, metrics, extra
@@ -334,16 +326,13 @@ def _optimize_lines(result, extra) -> list[str]:
                            else (f"{k} > {lo:.5g}" if np.isfinite(lo) else f"{k} < {hi:.5g}")
                            for k, (lo, hi) in cuts.items()
                            if np.isfinite(lo) or np.isfinite(hi))
-    ref = extra["cosmic_reference"]
+    cs = extra["cosmic_sample"]
     return [
         "cut_mode = optimize: the preselection (" + ", ".join(extra["preselection"])
         + "), the time window {:g}-{:g} ns (fixed)".format(*extra["time_window"])
         + " and cuts tuned on the Punzi FoM, chosen on even events, reported on odd",
-        f"  cosmic reference {ref.get('path')} ({ref.get('dataset', '?')}; "
-        f"reco {ref.get('reco', '?')}; "
-        + (f"CRY livetime {ref['livetime_s']:.4g} s from {ref.get('s2_events', 0):.4g} S2 events)"
-           if ref.get("livetime_s") else
-           f"{ref.get('n_normalizing', '?')} tracks normalizing to the loose rate)"),
+        f"  cosmics: {cs['n_rows']} tracks of {cs['dataset']} ({cs['n_files']} files, "
+        f"CRY livetime {cs['livetime_s']:.4g} s from {cs['s2_events']:.4g} S2 events)",
         "  seed:  [{:.1f}, {:.1f}] MeV/c, ".format(*result.window_mev(result.seed_window))
         + cut_text(result.seed_cuts),
         f"         Punzi train {result.seed_train.fom:.4g}, test {result.seed_test.fom:.4g} "
@@ -379,11 +368,13 @@ def find_cosmic_dataset(source: str, input_names: list[str]) -> str:
 def measure_cosmics(params: dict, input_names: list[str], active: list[str],
                     triggers, time_window, onspill_seconds: float,
                     trkqual_min: float, trkpid_min: float,
-                    cut_set: str) -> dict | None:
+                    cut_set: str, presel: tuple | None = None) -> dict | None:
     """The cosmic background from the cosmic mix: its files reduced with the
     same cuts and thresholds as the inputs (trkqual_min/trkpid_min as
     resolved from the cut set), the cosmic tracks in the time window, and
     the weight each carries (on-spill time over the sample's livetime).
+    With `presel` (cut_mode="optimize"), also each file's candidate tracks
+    for the tuning (tune.candidate_tracks), from the same read.
     None for 'rate'."""
     source = params["cosmic_source"].strip()
     if source.lower() == cosmics.COSMIC_RATE:
@@ -406,8 +397,15 @@ def measure_cosmics(params: dict, input_names: list[str], active: list[str],
     tau = params["cosmic_livetime_per_event"] or cosmics.livetime_per_event(s1_file)
     s2_events = sum(generated_events_bulk(names).values())
     livetime = s2_events * tau
-    ev = combine([reduce_file(path, active, trkqual_min, trkpid_min, triggers,
-                              cut_set) for path in paths])
+    parts, candidates = [], []
+    for path in paths:
+        data = read_eventntuple(path, triggers)
+        parts.append(reduce_data(data, active, trkqual_min, trkpid_min,
+                                 triggers, cut_set))
+        if presel is not None:
+            candidates.append(tune.candidate_tracks(data, presel, triggers, cut_set))
+        del data
+    ev = combine(parts)
     counted = cosmics.cosmic_counts(ev, time_window)
     like = Spectrum.from_values(np.zeros(0), *SIGNAL_BINNING).rebin(SIGNAL_REBIN)
     weight = onspill_seconds / livetime
@@ -416,7 +414,9 @@ def measure_cosmics(params: dict, input_names: list[str], active: list[str],
             "livetime_per_event": tau, "s2_events": s2_events,
             "livetime": livetime, "weight": weight, "ev": ev,
             "counted": counted, "n_counted": int(counted.sum()),
-            "shape": shape, **spectrum}
+            "shape": shape,
+            "candidates": tune.combine_tracks(candidates) if candidates else None,
+            **spectrum}
 
 
 COSMIC_METRICS = ("cosmic_livetime_s", "cosmic_weight", "n_cosmic_files",
@@ -567,9 +567,15 @@ def run(context: RunContext) -> RunOutcome:
             raise FullsimError(f"cut_mode must be one of {', '.join(CUT_MODES)}, "
                                f"got {cut_mode!r}")
         extra["cut_mode"] = cut_mode
-        # optimize: the active cuts less the tuned and target ones, checked
-        # against what the cosmic reference can follow before any file is read
+        # optimize: the active cuts less the tuned and target ones; its
+        # cosmics are the measured cosmic mix's, so it needs one
         presel = tune.optimize_preselection(active) if cut_mode == "optimize" else ()
+        if (cut_mode == "optimize"
+                and params["cosmic_source"].strip().lower() == cosmics.COSMIC_RATE):
+            raise FullsimError(
+                "cut_mode='optimize' tunes against the cosmic mix's tracks, so "
+                "cosmic_source cannot be 'rate': leave it 'auto' or name the "
+                "cosmic nts dataset")
         parts, candidates = [], []
         for path in context.input_paths:
             data = read_eventntuple(path, triggers)
@@ -625,7 +631,8 @@ def run(context: RunContext) -> RunOutcome:
                            * ONSPILL_SECONDS_PER_EVENT)
         cosmic = measure_cosmics(params, [path.name for path in context.input_paths],
                                  active, triggers, (t_lo, t_hi), onspill_seconds,
-                                 trkqual_min, trkpid_min, cut_set)
+                                 trkqual_min, trkpid_min, cut_set,
+                                 presel if cut_mode == "optimize" else None)
         if cosmic is not None:
             # The rate the measurement amounts to, per second per MeV/c of
             # on-spill time, so the metric means what it did with 'rate'.
@@ -712,8 +719,8 @@ def run(context: RunContext) -> RunOutcome:
         try:
             tuned, opt_metrics, opt_extra = _optimize_selection(
                 candidates, cut_set, presel, (t_lo, t_hi), n_generated, upstream_eff,
-                spectra, rmue, params["cosmic_reference"])
-        except (tune.TuneError, cosmic_reference.ReferenceError) as exc:
+                spectra, rmue, cosmic)
+        except tune.TuneError as exc:
             return RunOutcome(error=f"cut_mode='optimize': {exc}", extra=extra)
         metrics.update(opt_metrics)
         extra["optimize"] = opt_extra
@@ -1027,27 +1034,16 @@ SPEC = AnalysisSpec(
                         "disable_cuts leave them, no stopping-target cuts, "
                         "the time window fixed, and rectangular cuts on "
                         "cos(theta), R(max), d0, TrkQual, TrkPID, t0err and "
-                        "N(active)) on the Punzi FoM, against a fixed "
-                        "reconstructed cosmic reference (cosmic_reference; "
-                        "electrons and muons) and the DIO folded per event; "
-                        "chosen on even events, reported on odd ones as the "
-                        "opt_* metrics (-1 in fixed mode; an opt_cut_* edge "
-                        "left open is NaN). The default reference is CRY "
-                        "signal-region cosmics (MDC2025ap) reconstructed "
-                        "primary-only, without pileup, with "
-                        "Code_ana_v020301_fcl_mdc2025bc: its TrkQual, TrkPID, "
-                        "N(active) and t0err match inputs reconstructed the "
-                        "same way; for mixed (Mix1BB) or other-release inputs "
-                        "they are approximate, and a matching reference should "
-                        "be made. The fixed result is reported either way.",
+                        "N(active)) on the Punzi FoM, against the cosmic "
+                        "mix's tracks (the cosmic_source sample, read once for "
+                        "both modes; electrons and muons, each weighted by "
+                        "on-spill time over the sample's livetime) and the DIO "
+                        "folded per event; chosen on even events, reported on "
+                        "odd ones as the opt_* metrics (-1 in fixed mode; an "
+                        "opt_cut_* edge left open is NaN). Needs a measured "
+                        "cosmic sample (cosmic_source not 'rate'). The fixed "
+                        "result is reported either way.",
             default="fixed", kind="text",
-        ),
-        ParamSpec(
-            name="cosmic_reference",
-            description="cut_mode='optimize': the cosmic reference table "
-                        "(.npz, from scripts/make_fullsim_cosmic_reference.py). "
-                        "Empty: data/fullsim_cosmic_reference.npz.",
-            default="", kind="text", allow_empty=True,
         ),
         ParamSpec(
             name="cut_set",
