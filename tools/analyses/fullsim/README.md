@@ -3,10 +3,12 @@
 Analyses of reconstructed EventNtuple files (`EventNtuple/ntuple`) with MC
 truth. Today there is one, `fullsim_sensitivity`, the full-simulation
 counterpart of `approx_ce_sensitivity`. It computes the same S/sqrt(B) in
-the best momentum window, with the same DIO and cosmic backgrounds, but
-measures the signal efficiency, shape and detector response from
-reconstructed CE mixed with pileup, after a pyfitter CE-like cut set:
-`run1a_tsda` with a 540-1650 ns time window.
+the best momentum window, with the same DIO background, but measures the
+signal efficiency, shape and detector response from reconstructed CE mixed
+with pileup, after a pyfitter CE-like cut set (`run1a_tsda` with a
+540-1650 ns time window), and the cosmic background on the matching
+official cosmic mix through the same cuts (`cosmic_source` `rate` keeps
+`approx_ce_sensitivity`'s flat rate).
 The repo README.md, under `fullsim_sensitivity`, says how each step is
 computed.
 
@@ -86,11 +88,12 @@ number (1.28e-5; cosmics 1.90, S/sqrt(B) = 3.98 with `cosmic_source`
 | parameter | default | what it does |
 |---|---|---|
 | `npot`, `mean_pot_per_event` | as `approx_ce_sensitivity` | NPOT, and the on-spill time they imply, which the cosmics are scaled to. |
-| `cosmic_source` | `auto` | `auto`: measure the cosmics on the cosmic mix matching the inputs (`nts.mu2e.CosmicSignalMix1BB.MDC2025au_best_v1_1-001.root` here). A SAM dataset name: measure on that. `rate`: flat at `cosmic_rate_per_s_per_mev`, reading no cosmic files. |
+| `cosmic_source` | `auto` | `auto`: measure the cosmics on the cosmic mix matching the inputs (`nts.mu2e.CosmicSignalMix1BB.MDC2025au_best_v1_1-001.root` here). A SAM dataset name: measure on that. A path (anything with a `/`): comma-separated EventNtuple `.root` files, directories or globs on disk, each file name once. `rate`: flat at `cosmic_rate_per_s_per_mev`, reading no cosmic files. A setting that cannot work is refused before any file is read. |
 | `cosmic_max_files` | 0 (all) | Read only the first this-many cosmic files by name; the livetime counts only those. With `cut_mode` `optimize` the sample is read too, for the fixed-cut result. Each MDC2025au file is ~11,400 s of cosmics and takes ~6 s. |
-| `cosmic_shape` | `flat` | `flat`: the cosmic count in 100-110 MeV/c spread evenly per MeV/c (2.3 events, the 90% CL limit, if none). `measured`: binned as they are; the scan then finds windows between single events, so read it as a check. |
+| `cosmic_shape` | `flat` | `flat`: the cosmic count in [100, 110) MeV/c spread evenly per MeV/c, never below 2.303 events (the 90% CL limit for none seen), so a track seen never lowers the rate. `measured`: binned as they are, with no floor; the scan then finds windows between single events, so read it as a check. |
 | `cosmic_livetime_per_event` | 0 (table) | Seconds of cosmics per S1 event; 0 takes it from `S1_LIVETIME_PER_EVENT` by the S1 dataset the cosmic files trace to. |
-| `cosmic_rate_per_s_per_mev` | as `approx_ce_sensitivity` | The flat rate, with `cosmic_source` `rate` only. |
+| `cosmic_livetime_s` | 0 (from SAM) | The total cosmic livetime of every file `cosmic_source` names, for files SAM does not know. Cannot be combined with `cosmic_max_files`. |
+| `cosmic_rate_per_s_per_mev` | as `approx_ce_sensitivity` | The flat rate, with `cosmic_source` `rate` only; any other value is refused when the cosmics are measured. |
 | `stopped_muons_per_pot` | 0 (compute from SAM) | Stopped mu- per POT: MuBeamCat x MuminusStopsCat efficiency x 1000. Signal and DIO scale with NPOT times this. 0 computes it in SAM from the chain `stop_datasets` gives; a number (7.67e-4 for the MDC2025 chain) skips SAM. |
 | `stop_datasets` | `auto` | The stop chain. `auto` traces it from the inputs' SAM ancestry: the MuminusStopsCat dataset the CE were generated from, then the MuBeamCat dataset that came from (for the MDC2025au_best_v1_1 CE mix, `sim.mu2e.MuBeamCat.MDC2025ab.art, sim.mu2e.MuminusStopsCat.MDC2025ac.art`). Or name the datasets, one per stage, for inputs whose ancestry is not in SAM. Each stage's efficiency is events in the dataset over events generated (`event_count` / `dh.gencount`, summed over its files), as `mu2eGenFilterEff` computes it, so no conditions-database table is needed. |
 | `rmue` | 1e-13 | R_mue, relative to capture: the expected CE count is NPOT x `stopped_muons_per_pot` x 0.609 x `rmue`. |
@@ -152,7 +155,7 @@ In `output_dir`:
 | `n_events_generated`, `acceptance` | events generated for the inputs, and the fraction of them that reached the ntuple |
 | `n_files`, `npot`, `upstream_eff`, `cosmic_rate_per_s_per_mev`, `stopped_muons_per_pot`, `rmue` | the inputs behind the numbers (`cosmic_rate_per_s_per_mev` is the measured one unless `cosmic_source` is `rate`) |
 | `cosmic_livetime_s`, `cosmic_weight` | the cosmic sample's livetime, and the run events each counted cosmic stands for (-1 with `rate`) |
-| `n_cosmic_files`, `n_cosmic_events`, `n_cosmic_counted`, `n_cosmic_flat_range`, `cosmic_upper_limit` | cosmic files and events read, cosmic tracks passing in the time window, those in 100-110 MeV/c, and 1 if the zero-count limit was used (-1 with `rate`) |
+| `n_cosmic_files`, `n_cosmic_events`, `n_cosmic_counted`, `n_cosmic_flat_range`, `cosmic_upper_limit` | cosmic files and events read, cosmic tracks passing in the time window, those in 100-110 MeV/c, and 1 if fewer than 2.303 were seen and the limit was scored (-1 with `rate`). The files read are in `cosmic_sample.files` |
 | `n_stopped_muons`, `n_conversions` | stopped mu- for `npot`, and the CE they give at `rmue` before any efficiency |
 | `opt_*` | `cut_mode="optimize"` only, -1 otherwise: see below |
 
@@ -186,7 +189,7 @@ the selection is also tuned on the inputs:
   mode's (S2 events from SAM x the S1 livetime per event). The mix is
   reconstructed with the inputs' own code, conditions and pileup, so its
   TrkQual, TrkPID, N(active) and t0err match the CE rows'. Every species is
-  kept at that same weight: about a third of the loose tracks are muons,
+  kept at that same weight: many of the preselected cosmic tracks are muons,
   and without them the search would drop TrkPID for free. Optimize mode
   needs the mix: `cosmic_source` `rate` is an error in it.
 - **Search**: the shared optimizer (`tools/analyses/optimize.py`, as
@@ -289,17 +292,24 @@ synthetic events. When the CeMLeadingLogMix1BB file above is on disk it
 also checks pyfitter's cut flow, the measured efficiency, the window and
 the acceptance and `upstream_eff` scaling on it (with `n_generated`
 given and `cosmic_source` `rate`, so it needs no network). The cosmic
-tests cover finding the cosmic mix from the CE mix's name, decoding the S1
+tests cover finding the cosmic mix from the CE mix's name (and a catalog
+out of reach not being taken for a missing dataset), decoding the S1
 livetime products, the bulk gencount lookup and the S2 events behind each
-file (with a fake SAM), which tracks count, the flat and measured spectra,
-and refusing a bad `cosmic_shape` before reading anything. One test
-measures the cosmics on three files of the real cosmic mix next to the CE
-file; it needs SAM for the livetime and skips without it. The optimize mode's search is tested on toy
-events through the shared optimizer (the obvious cuts, the cut conversion and
-unplaced edges, half-integer edges, tiny DIO weights beside large cosmic
-ones), its DIO weights against the spectrum, the
-reference's normalization (muons kept, electrons normalizing), a toy in
-which TrkPID must stay cut against cosmic muons, the preselection following
-`enable_cuts`/`disable_cuts` (and refusing what the reference cannot
-follow), the seed's run1a d0 window, and, on the CE mix file, a full run
-with a toy reference.
+file (with a fake SAM), which tracks count, the flat and measured spectra
+and the 2.303 floor, path sources (repeated file names refused),
+`measure_cosmics` with the reads and SAM faked (the CE thresholds and time
+window reach the cosmics, the livetime is S2 events x tau, the CE files
+are refused as cosmics), a fake cosmic spectrum reaching
+`cosmic_background` through a full run, and bad settings refused before
+any file is read. One test measures the cosmics on the first three files
+of the real cosmic mix next to the CE file and pins their counts,
+background and S/sqrt(B), against a `rate` run on the same file; it needs
+SAM for the livetime and skips only when SAM or the files cannot be
+reached. The optimize mode's search is tested on toy events through the
+shared optimizer (the obvious cuts, the cut conversion and unplaced edges,
+half-integer edges, tiny DIO weights beside large cosmic ones), its DIO
+weights against the spectrum, the cosmic mix's rows (in range and time,
+muons kept, weighted by livetime), a toy in which TrkPID must stay cut
+against cosmic muons, the preselection following
+`enable_cuts`/`disable_cuts`, the seed's run1a d0 window, and, on the CE
+mix file, a full run with toy cosmic-mix tracks.

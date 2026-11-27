@@ -9,7 +9,9 @@ each stands for (on-spill time / simulated cosmic livetime) of the run.
 The livetime is not read from the files' CosmicLivetime products. The S2
 resampler stores them truncated by an integer division in
 Mu2eProductMixer::endSubRun (zero, or up to ~25% low, for every resampled
-cosmic sample since 2021), and EventNtuple files carry none. It is computed
+cosmic sample from 2021 until Offline 52ff4a0d, 2026-08-24, which casts both
+counts to float; samples made after it store a correct livetime), and
+EventNtuple files carry none. It is computed
 from what the S2 resampler was meant to store instead:
 
     livetime = (S2 events resampled) x (S1 livetime / S1 events generated)
@@ -55,13 +57,15 @@ S1_LIVETIME_PER_EVENT = {
 # shape values: flat at the count in COSMIC_FLAT_RANGE, or as measured.
 SHAPE_FLAT = "flat"
 SHAPE_MEASURED = "measured"
-# Where the flat rate is counted (MeV/c): pyfitter's fit range
+# Where the flat rate is counted (MeV/c), [lo, hi): pyfitter's fit range
 # (in_mom_range), the region the signal window is scanned in; the same
-# range cut_mode="optimize" normalizes its cosmic reference over.
+# range cut_mode="optimize" keeps the cosmic mix's tracks in
+# (tune.cosmic_rows).
 COSMIC_FLAT_RANGE = COSMIC_FLAT_MEV
-# The 90% CL Poisson upper limit on a mean when nothing is seen: the count
-# used for the flat rate when no cosmic passes, so a window never looks
-# background-free for want of cosmic statistics.
+# The 90% CL Poisson upper limit on a mean when nothing is seen: the floor
+# on the count the flat rate uses, so a window never looks background-free
+# for want of cosmic statistics, and the rate never falls as tracks are
+# added (one or two tracks count as 2.303 too).
 ZERO_COUNT_UPPER_LIMIT = 2.303
 
 # The subrun products of an S1 CRY file, and their streamed layout after
@@ -86,7 +90,10 @@ def is_path_source(source: str) -> bool:
 def cosmic_paths(source: str) -> list[Path]:
     """The EventNtuple files cosmic_source names on disk: comma-separated
     entries, each a .root file, a directory (its *.root files) or a glob;
-    sorted by name and without repeats, as a dataset's files are."""
+    sorted by name and without repeats, as a dataset's files are. Two
+    different paths with the same file name are refused: the livetime is
+    looked up in SAM by file name, so a copy would be read twice but
+    counted once."""
     paths: set[Path] = set()
     for entry in (e.strip() for e in source.split(",")):
         if not entry:
@@ -108,7 +115,17 @@ def cosmic_paths(source: str) -> list[Path]:
         paths.update(found)
     if not paths:
         raise CosmicError("cosmic_source names no files")
-    return sorted(paths, key=lambda p: (p.name, str(p)))
+    by_name: dict[str, list[Path]] = {}
+    for path in paths:
+        by_name.setdefault(path.name, []).append(path)
+    repeated = {name: sorted(map(str, ps)) for name, ps in by_name.items() if len(ps) > 1}
+    if repeated:
+        name, where = sorted(repeated.items())[0]
+        raise CosmicError(
+            f"cosmic_source names {len(repeated)} file name(s) more than once "
+            f"(e.g. {name} at {' and '.join(where)}); each file's livetime is "
+            "counted by name, so name each file once")
+    return sorted(paths, key=lambda p: p.name)
 
 
 def cosmic_datasets_for(input_names: list[str]) -> list[str]:
@@ -189,21 +206,24 @@ def cosmic_spectrum(p: np.ndarray, weight: float, like, shape: str) -> dict:
     """The cosmic count per bin of spectrum `like`, from the cosmic tracks'
     momenta `p` each standing for `weight` run events.
 
-    flat: the count in COSMIC_FLAT_RANGE, spread evenly per MeV/c
-    (ZERO_COUNT_UPPER_LIMIT if none); measured: the tracks binned as they are.
+    flat: the count in COSMIC_FLAT_RANGE, at least ZERO_COUNT_UPPER_LIMIT,
+    spread evenly per MeV/c; measured: the tracks binned as they are.
+    rate_per_mev is the rate scored: for measured, the tracks in
+    COSMIC_FLAT_RANGE with no floor. upper_limit says the floor set it.
     """
     lo, hi = COSMIC_FLAT_RANGE
     n_flat = int(((p >= lo) & (p < hi)).sum())
-    upper_limit = n_flat == 0
-    per_mev = (ZERO_COUNT_UPPER_LIMIT if upper_limit else n_flat) * weight / (hi - lo)
     if shape == SHAPE_FLAT:
+        upper_limit = n_flat < ZERO_COUNT_UPPER_LIMIT
+        per_mev = max(n_flat, ZERO_COUNT_UPPER_LIMIT) * weight / (hi - lo)
         values = np.full(like.nbins, per_mev * like.width)
     elif shape == SHAPE_MEASURED:
+        upper_limit = False
+        per_mev = n_flat * weight / (hi - lo)
         values, _ = np.histogram(p, bins=like.edges())
         values = values * weight
     else:
         raise CosmicError(f"cosmic_shape {shape!r} must be '{SHAPE_FLAT}' or "
                           f"'{SHAPE_MEASURED}'")
     return {"values": values.astype(np.float64), "n_flat_range": n_flat,
-            "upper_limit": upper_limit and shape == SHAPE_FLAT,
-            "rate_per_mev": per_mev}
+            "upper_limit": upper_limit, "rate_per_mev": per_mev}

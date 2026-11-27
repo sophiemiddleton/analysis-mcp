@@ -50,7 +50,8 @@ from pathlib import Path
 import numpy as np
 
 from ... import catalog
-from ...catalog import CatalogError, dataset_file_names, resolve_inputs
+from ...catalog import (CatalogError, NoSuchDataset, dataset_file_names,
+                        resolve_inputs)
 from ...spec import AnalysisSpec, ParamSpec, RunContext, RunOutcome
 from ...spectrum import Kernel, Spectrum
 from ..approx_ce_sensitivity import (COSMIC_RATE_PER_SECOND_PER_MEV,
@@ -351,7 +352,10 @@ def _optimize_lines(result, extra) -> list[str]:
 
 def find_cosmic_dataset(source: str, input_names: list[str]) -> str:
     """The cosmic mix dataset cosmic_source names, or for 'auto' the first
-    of the ones matching the inputs that the catalogs know."""
+    of the ones matching the inputs that the catalogs know. Only a definite
+    "no such dataset" moves on to the next candidate: a catalog that cannot
+    be reached is raised, so a network failure never picks another sample
+    or reads as "no cosmic mix"."""
     if source.lower() != cosmics.COSMIC_AUTO:
         return source
     candidates = cosmics.cosmic_datasets_for(input_names)
@@ -359,12 +363,42 @@ def find_cosmic_dataset(source: str, input_names: list[str]) -> str:
         try:
             if dataset_file_names(candidate, catalog.CLIENT)[0]:
                 return candidate
-        except CatalogError:
+        except NoSuchDataset:
             continue
     raise cosmics.CosmicError(
         f"no cosmic mix matching the inputs in SAM or metacat (tried "
         f"{', '.join(candidates)}); name one in cosmic_source, or 'rate' "
         "for the flat rate")
+
+
+def check_cosmic_source(params: dict, input_names: list[str]) -> None:
+    """Refuse a cosmic setting that cannot work, from the names alone, before
+    any file is read (the CE files and the stop chain take minutes, the
+    cosmic sample most of an hour)."""
+    source = params["cosmic_source"].strip()
+    if source.lower() == cosmics.COSMIC_RATE:
+        return
+    if (params.get("cosmic_rate_per_s_per_mev", COSMIC_RATE_PER_SECOND_PER_MEV)
+            != COSMIC_RATE_PER_SECOND_PER_MEV):
+        raise cosmics.CosmicError(
+            f"cosmic_rate_per_s_per_mev is used only with cosmic_source "
+            f"'rate', but cosmic_source is {source!r}, whose measured rate "
+            "would replace it; set cosmic_source to 'rate' to use the rate "
+            "given, or leave the rate at its default")
+    shape = params["cosmic_shape"].strip().lower()
+    if shape not in (cosmics.SHAPE_FLAT, cosmics.SHAPE_MEASURED):
+        raise cosmics.CosmicError(
+            f"cosmic_shape {shape!r} must be '{cosmics.SHAPE_FLAT}' or "
+            f"'{cosmics.SHAPE_MEASURED}'")
+    if params.get("cosmic_livetime_s", 0.0) > 0 and int(params["cosmic_max_files"]):
+        raise cosmics.CosmicError(
+            "cosmic_livetime_s is the livetime of every file cosmic_source "
+            "names, so it cannot be combined with cosmic_max_files, which "
+            "reads only some of them; name just the files to read instead")
+    if cosmics.is_path_source(source):
+        cosmics.cosmic_paths(source)
+    elif source.lower() == cosmics.COSMIC_AUTO:
+        cosmics.cosmic_datasets_for(input_names)
 
 
 def measure_cosmics(params: dict, input_names: list[str], active: list[str],
@@ -381,12 +415,9 @@ def measure_cosmics(params: dict, input_names: list[str], active: list[str],
     source = params["cosmic_source"].strip()
     if source.lower() == cosmics.COSMIC_RATE:
         return None
+    # Before reading the sample, which can take most of an hour.
+    check_cosmic_source(params, input_names)
     shape = params["cosmic_shape"].strip().lower()
-    if shape not in (cosmics.SHAPE_FLAT, cosmics.SHAPE_MEASURED):
-        # Before reading the sample, which can take most of an hour.
-        raise cosmics.CosmicError(
-            f"cosmic_shape {shape!r} must be '{cosmics.SHAPE_FLAT}' or "
-            f"'{cosmics.SHAPE_MEASURED}'")
     max_files = int(params["cosmic_max_files"]) or None
     if cosmics.is_path_source(source):
         # nts files on disk: the sample is named by the paths given
@@ -431,7 +462,8 @@ def measure_cosmics(params: dict, input_names: list[str], active: list[str],
     like = Spectrum.from_values(np.zeros(0), *SIGNAL_BINNING).rebin(SIGNAL_REBIN)
     weight = onspill_seconds / livetime
     spectrum = cosmics.cosmic_spectrum(ev["p"][counted], weight, like, shape)
-    return {"dataset": dataset, "n_files": len(paths), "s1_file": s1_file,
+    return {"dataset": dataset, "n_files": len(paths), "files": names,
+            "s1_file": s1_file,
             "livetime_per_event": tau, "s2_events": s2_events,
             "livetime": livetime, "weight": weight, "ev": ev,
             "counted": counted, "n_counted": int(counted.sum()),
@@ -465,7 +497,8 @@ def cosmic_log_lines(cosmic: dict | None, rate: float, spectra: dict) -> list[st
         return [f"  cosmic rate      {rate:.4g} per s per MeV/c (cosmic_source "
                 f"'rate') -> {spectra['cosmic_rate_per_mev']:.4g} per MeV/c {onspill}"]
     lo, hi = cosmics.COSMIC_FLAT_RANGE
-    seen = (f"{cosmics.ZERO_COUNT_UPPER_LIMIT:g} (90% CL limit: none seen)"
+    seen = (f"{cosmics.ZERO_COUNT_UPPER_LIMIT:g} (90% CL limit for none seen: "
+            f"{cosmic['n_flat_range']} seen)"
             if cosmic["upper_limit"] else str(cosmic["n_flat_range"]))
     livetime = (f"{cosmic['livetime']:.5g} s (cosmic_livetime_s)"
                 if cosmic["s2_events"] is None else
@@ -600,6 +633,7 @@ def run(context: RunContext) -> RunOutcome:
                 "cut_mode='optimize' tunes against the cosmic mix's tracks, so "
                 "cosmic_source cannot be 'rate': leave it 'auto' or name the "
                 "cosmic nts dataset")
+        check_cosmic_source(params, [path.name for path in context.input_paths])
         parts, candidates = [], []
         for path in context.input_paths:
             data = read_eventntuple(path, triggers)
@@ -661,9 +695,11 @@ def run(context: RunContext) -> RunOutcome:
             # The rate the measurement amounts to, per second per MeV/c of
             # on-spill time, so the metric means what it did with 'rate'.
             cosmic_rate_per_s_per_mev = cosmic["rate_per_mev"] / onspill_seconds
+            # The files themselves, so a re-run on a dataset or glob whose
+            # contents have changed can be told apart.
             extra["cosmic_sample"] = {
                 key: cosmic[key] for key in
-                ("dataset", "n_files", "s1_file", "livetime_per_event",
+                ("dataset", "n_files", "files", "s1_file", "livetime_per_event",
                  "s2_events", "livetime", "weight", "n_counted",
                  "n_flat_range", "upper_limit")}
         spectra = build_spectra(ev["p"][counted], ev["p_true"][counted],
@@ -839,7 +875,8 @@ def summarize(metrics: dict[str, float]) -> str:
            f"tracks in {cosmics.COSMIC_FLAT_RANGE[0]:g}-"
            f"{cosmics.COSMIC_FLAT_RANGE[1]:g} MeV/c in "
            f"{metrics['cosmic_livetime_s']:.3g} s of cosmics"
-           + (" (none: 90% CL upper limit used)." if metrics["cosmic_upper_limit"] > 0
+           + (f" (fewer than {cosmics.ZERO_COUNT_UPPER_LIMIT:g}: the 90% CL "
+              "upper limit for none seen used)." if metrics["cosmic_upper_limit"] > 0
               else ".")
            if metrics["n_cosmic_files"] > 0 else "cosmics from the flat rate.")
     )
@@ -985,11 +1022,11 @@ SPEC = AnalysisSpec(
                         "'flat' (the default): the cosmic tracks counted in "
                         f"{cosmics.COSMIC_FLAT_RANGE[0]:g}-"
                         f"{cosmics.COSMIC_FLAT_RANGE[1]:g} MeV/c spread evenly "
-                        "per MeV/c, or the 90% CL upper limit "
-                        f"({cosmics.ZERO_COUNT_UPPER_LIMIT:g} events) when "
-                        "none is, so the scan cannot chase gaps between single "
-                        "events. 'measured': the counted tracks binned as they "
-                        "are.",
+                        "per MeV/c, never fewer than the 90% CL upper limit "
+                        f"for none seen ({cosmics.ZERO_COUNT_UPPER_LIMIT:g} "
+                        "events), so the scan cannot chase gaps between single "
+                        "events and a track seen never lowers the rate. "
+                        "'measured': the counted tracks binned as they are.",
             default=cosmics.SHAPE_FLAT, kind="text",
         ),
         ParamSpec(
@@ -1009,11 +1046,12 @@ SPEC = AnalysisSpec(
         ParamSpec(
             name="cosmic_livetime_s",
             description="The total cosmic livetime (s) of the cosmic sample "
-                        "read (after cosmic_max_files), for files whose "
+                        "named, for files whose "
                         "provenance SAM does not have, e.g. a private cosmic "
                         "nts given as a path in cosmic_source. 0 (the "
                         "default) computes it from SAM: S2 events resampled "
-                        "x cosmic_livetime_per_event.",
+                        "x cosmic_livetime_per_event. Cannot be combined "
+                        "with cosmic_max_files.",
             default=0.0, minimum=0.0,
         ),
         ParamSpec(
@@ -1023,8 +1061,9 @@ SPEC = AnalysisSpec(
                         "approx_ce_sensitivity (whose default this is: the "
                         "rough Run-1A mu- -> e- number), scaled by the "
                         "on-spill live time npot and mean_pot_per_event imply. "
-                        "Ignored otherwise; the metric of the same name then "
-                        "reports the measured rate.",
+                        "Refused unless left at the default otherwise; the "
+                        "metric of the same name then reports the measured "
+                        "rate.",
             default=COSMIC_RATE_PER_SECOND_PER_MEV, minimum=0.0,
         ),
         ParamSpec(

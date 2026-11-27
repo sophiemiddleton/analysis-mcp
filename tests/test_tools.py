@@ -3277,8 +3277,9 @@ def test_fullsim_generated_events_come_from_the_nearest_ancestor_with_gencount()
 def test_fullsim_run_reports_a_file_that_is_not_an_eventntuple(tmp_dir):
     path = Path(tmp_dir) / "nts.owner.edep.test.root"
     _write_edep_tree(path, n=10)
+    # 'rate': 'auto' would refuse this file's name before reading it
     result = run_analysis(analysis="fullsim_sensitivity", data_file=str(path),
-                          output_dir=tmp_dir)
+                          output_dir=tmp_dir, parameters={"cosmic_source": "rate"})
     assert result.status == "error" and "EventNtuple/ntuple" in result.message
     window = run_analysis(analysis="fullsim_sensitivity", data_file=str(path),
                           output_dir=tmp_dir, parameters={"time_window": "1650,640"})
@@ -3396,6 +3397,17 @@ def test_fullsim_auto_takes_the_first_cosmic_mix_the_catalog_has(tmp_dir):
             assert "no cosmic mix matching" in str(exc) and "'rate'" in str(exc)
         else:
             raise AssertionError("no error without a cosmic mix")
+        # a catalog out of reach is said so, not taken for a missing dataset
+        # (which would move on to the next candidate)
+        catalog.CLIENT = FakeCatalogs(sam_defs={second: ["f"]}, down=True)
+        try:
+            fs_sens.find_cosmic_dataset("auto", [CE_MIX_NAME])
+        except catalog.CatalogError as exc:
+            assert "cannot list dataset" in str(exc) and "CosmicSignal" in str(exc), exc
+            assert not isinstance(exc, catalog.NoSuchDataset)
+        else:
+            raise AssertionError("a network failure picked a cosmic mix")
+        assert len(catalog.CLIENT.asked) == 1
     finally:
         catalog.CLIENT = real
 
@@ -3470,6 +3482,19 @@ def test_fullsim_cosmic_spectrum_is_flat_at_the_measured_count():
     none = cosmics.cosmic_spectrum(np.array([95.0]), 0.5, like, "flat")
     assert none["upper_limit"] and np.isclose(
         none["values"].sum(), cosmics.ZERO_COUNT_UPPER_LIMIT * 0.5 / 10 * like.width * like.nbins)
+    # the rate never falls as tracks are seen: one or two score the limit too
+    rates = [cosmics.cosmic_spectrum(np.full(n, 104.0), 0.5, like, "flat")["rate_per_mev"]
+             for n in range(5)]
+    assert rates == sorted(rates) and rates[0] == rates[1] == rates[2] < rates[3]
+    assert cosmics.cosmic_spectrum(np.full(2, 104.0), 0.5, like, "flat")["upper_limit"]
+    assert not cosmics.cosmic_spectrum(np.full(3, 104.0), 0.5, like, "flat")["upper_limit"]
+    # measured: the rate reported is the one scored, with no floor
+    empty = cosmics.cosmic_spectrum(np.array([95.0]), 0.5, like, "measured")
+    assert empty["rate_per_mev"] == 0.0 and not empty["upper_limit"]
+    assert np.isclose(measured["rate_per_mev"], 3 * 0.5 / 10)
+    # the range is [100, 110), as tune.cosmic_rows has it
+    edge = cosmics.cosmic_spectrum(np.array([100.0, 110.0]), 1.0, like, "flat")
+    assert edge["n_flat_range"] == 1
     try:
         cosmics.cosmic_spectrum(p, 0.5, like, "smooth")
     except cosmics.CosmicError as exc:
@@ -3502,35 +3527,196 @@ def test_fullsim_measured_cosmics_replace_the_flat_rate():
     assert np.array_equal(given["signal"].values, flat["signal"].values)
 
 
+# The first three CosmicSignalMix1BB MDC2025au files against the CE mix
+# file, 1e18 POT: 2.303 (the floor; 2 seen) x 3.0865 weight / 10 MeV/c over
+# the [103.5, 104.7] window, and S = 5.615 over sqrt(that + DIO 0.0011).
+COSMIC_MIX_BACKGROUND = 0.99515
+COSMIC_MIX_SENSITIVITY = 5.6260
+
+# What the real-mix test may skip on: SAM or metacat out of reach, or the
+# cosmic files on tape. Any other failure is a failure.
+UNREACHABLE = ("cannot list dataset", "not staged", "cannot read the SAM metadata",
+               "cannot look up where")
+
+
 def test_fullsim_measures_cosmics_on_the_cosmic_mix(tmp_dir):
-    """Three files of the official cosmic mix next to the CE mix file: 50M
-    S2 events each at the MDC2025ab S1 tau (needs SAM for the livetime)."""
+    """The first three files of the official cosmic mix next to the CE mix
+    file: 50M S2 events each at the MDC2025ab S1 tau (needs SAM for the
+    livetime). The counts are this sample's, so a change to the cuts, the
+    time window or the weighting that reaches the cosmics shows here."""
     if not CE_MIX_FILE.exists():
         print("     (skipped: CE mix file not on disk)")
         return
     from tools.analyses.fullsim import cosmics, normalization as norm
     params = {"n_generated": 20000, "stopped_muons_per_pot": norm.STOPPED_MUONS_PER_POT,
               "cosmic_max_files": 3}
-    try:
-        result = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
-                              output_dir=tmp_dir, parameters=params)
-    except Exception as exc:
-        print(f"     (skipped: {exc})")
-        return
-    if result.status != "success" and ("SAM" in result.message or "staged" in result.message):
+    result = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
+                          output_dir=tmp_dir, parameters=params)
+    if result.status != "success" and any(m in result.message for m in UNREACHABLE):
         print(f"     (skipped: {result.message[:100]})")
         return
     assert result.status == "success", result.message
     md = result.metadata
     tau = cosmics.S1_LIVETIME_PER_EVENT["sim.mu2e.CosmicDSStopsCRYAll.MDC2025ab.art"]
-    assert md["n_cosmic_files"] == 3
+    sample = md["cosmic_sample"]
+    assert sample["dataset"] == "nts.mu2e.CosmicSignalMix1BB.MDC2025au_best_v1_1-001.root"
+    assert md["n_cosmic_files"] == 3 and len(sample["files"]) == 3
+    assert sample["s2_events"] == 3 * 50000000
     assert np.isclose(md["cosmic_livetime_s"], 3 * 50000000 * tau)
     onspill = 1e18 / 1.6e7 * 1.695e-6
     assert np.isclose(md["cosmic_weight"], onspill / md["cosmic_livetime_s"])
-    n = md["n_cosmic_flat_range"]
+    # 24894 events; 7 cosmic tracks pass run1a_tsda in 540-1650 ns, 2 of
+    # them in 100-110 MeV/c: fewer than 2.303, so the limit is scored
+    assert md["n_cosmic_events"] == 24894
+    assert (md["n_cosmic_counted"], md["n_cosmic_flat_range"]) == (7, 2)
+    assert md["cosmic_upper_limit"] == 1.0
     assert np.isclose(md["cosmic_rate_per_s_per_mev"],
-                      (n or cosmics.ZERO_COUNT_UPPER_LIMIT) / md["cosmic_livetime_s"] / 10)
-    assert md["cosmic_upper_limit"] == float(n == 0)
+                      cosmics.ZERO_COUNT_UPPER_LIMIT / md["cosmic_livetime_s"] / 10)
+    assert np.isclose(md["cosmic_background"], COSMIC_MIX_BACKGROUND, rtol=1e-4)
+    assert np.isclose(md["sensitivity"], COSMIC_MIX_SENSITIVITY, rtol=1e-4)
+    # the measured cosmics are what the window sees: the flat rate on the
+    # same file gives another answer
+    flat = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
+                        output_dir=tmp_dir, parameters={**params, "cosmic_source": "rate"})
+    assert flat.status == "success", flat.message
+    assert not np.isclose(flat.metadata["cosmic_background"], md["cosmic_background"])
+    assert not np.isclose(flat.metadata["sensitivity"], md["sensitivity"])
+
+
+def _fake_cosmic_files(tmp_dir, names=("nts.a.root", "nts.b.root", "nts.c.root")):
+    d = Path(tmp_dir) / "cos"
+    d.mkdir(exist_ok=True)
+    for name in names:
+        (d / name).write_bytes(b"")
+    return d
+
+
+@contextlib.contextmanager
+def _patched(module, **fakes):
+    originals = {k: getattr(module, k) for k in fakes}
+    for k, v in fakes.items():
+        setattr(module, k, v)
+    try:
+        yield
+    finally:
+        for k, v in originals.items():
+            setattr(module, k, v)
+
+
+def test_fullsim_measure_cosmics_uses_the_ce_cuts_window_and_livetime(tmp_dir):
+    """measure_cosmics with the file reads and SAM faked: it reduces with the
+    thresholds it is given, counts only in-time cosmics, takes the S2 events
+    from SAM times the tau given, and refuses the CE files as cosmics."""
+    from tools.analyses.fullsim import cosmics
+    from tools.analyses.fullsim.eventntuple import ORIGIN_COSMIC
+    d = _fake_cosmic_files(tmp_dir)
+    # in time and in range x2, in time out of range, out of time, not a cosmic
+    ev = {"origin": np.array([ORIGIN_COSMIC] * 4 + [166]),
+          "t": np.array([900.0, 1000.0, 900.0, 500.0, 900.0]),
+          "p": np.array([101.0, 105.0, 120.0, 104.0, 104.0]), "n_events": 5}
+    seen = {}
+
+    def reduce_data(data, active, trkqual_min, trkpid_min, triggers, cut_set):
+        seen["thresholds"] = (trkqual_min, trkpid_min, cut_set)
+        return ev
+    s1 = "sim.mu2e.CosmicDSStopsCRYAll.MDC2025ab.001430_00004843.art"
+    with _patched(fs_sens, read_eventntuple=lambda path, triggers: {},
+                  reduce_data=reduce_data, combine=lambda parts: parts[0],
+                  root_ancestor=lambda name: s1,
+                  generated_events_bulk=lambda names: {n: 1000 for n in names}):
+        params = {"cosmic_source": str(d), "cosmic_shape": "flat", "cosmic_max_files": 0,
+                  "cosmic_livetime_per_event": 1e-3, "cosmic_livetime_s": 0.0}
+        args = (["nts.mu2e.CeMLeadingLogMix1BB.x.root"], [], (), (640.0, 1650.0),
+                30.0, 0.25, 0.75, fs_cuts.CUT_SET)
+        cosmic = fs_sens.measure_cosmics(params, *args)
+        assert seen["thresholds"] == (0.25, 0.75, fs_cuts.CUT_SET)
+        assert cosmic["n_counted"] == 3 and cosmic["n_flat_range"] == 2
+        # 3 files x 1000 S2 events x the tau given (not the table's)
+        assert cosmic["s2_events"] == 3000 and np.isclose(cosmic["livetime"], 3.0)
+        assert np.isclose(cosmic["weight"], 10.0)
+        assert cosmic["files"] == ["nts.a.root", "nts.b.root", "nts.c.root"]
+        assert cosmic["s1_file"] == s1
+        # tau from the table when none is given
+        table = fs_sens.measure_cosmics({**params, "cosmic_livetime_per_event": 0.0}, *args)
+        assert np.isclose(table["livetime"],
+                          3000 * cosmics.S1_LIVETIME_PER_EVENT[
+                              "sim.mu2e.CosmicDSStopsCRYAll.MDC2025ab.art"])
+        try:
+            fs_sens.measure_cosmics(params, ["nts.b.root"], *args[1:])
+        except cosmics.CosmicError as exc:
+            assert "shares files" in str(exc), exc
+        else:
+            raise AssertionError("the inputs were accepted as cosmics")
+
+
+def test_fullsim_measured_cosmic_values_reach_the_window(tmp_dir):
+    """run() scores the measured cosmic spectrum, not the flat rate: a fake
+    cosmic sample whose per-bin values disagree with its rate decides
+    cosmic_background."""
+    if not CE_MIX_FILE.exists():
+        print("     (skipped: CE mix file not on disk)")
+        return
+    from tools.analyses.fullsim import normalization as norm
+    from tools.spectrum import Spectrum
+    like = Spectrum.from_values(np.zeros(0), *fs_sens.SIGNAL_BINNING).rebin(fs_sens.SIGNAL_REBIN)
+    per_bin = 0.05
+
+    def fake(params, names, active, triggers, time_window, onspill, tq, tp, cut_set,
+             presel=None):
+        return {"dataset": "toy.cosmics", "n_files": 1, "files": ["toy.root"],
+                "s1_file": None, "livetime_per_event": None, "s2_events": None,
+                "livetime": 1.0, "weight": onspill, "n_counted": 1, "n_flat_range": 1,
+                "upper_limit": False, "shape": "flat",
+                "ev": {"n_events": 1, "origin": np.zeros(0), "p": np.zeros(0),
+                       "t": np.zeros(0)},
+                # a rate a hundred times below what the values say
+                "rate_per_mev": per_bin / like.width / 100,
+                "values": np.full(like.nbins, per_bin), "candidates": None}
+    base = {"n_generated": 20000, "stopped_muons_per_pot": norm.STOPPED_MUONS_PER_POT}
+    with _patched(fs_sens, measure_cosmics=fake):
+        r = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
+                         output_dir=tmp_dir, parameters=base)
+    assert r.status == "success", r.message
+    m = r.metadata
+    # the window's ends are bin centres, both bins in
+    n_bins = round((m["signal_mom_high_mevc"] - m["signal_mom_low_mevc"]) / like.width) + 1
+    assert np.isclose(m["cosmic_background"], per_bin * n_bins), (m["cosmic_background"], n_bins)
+    assert m["cosmic_sample"]["files"] == ["toy.root"]
+
+
+def test_fullsim_bad_cosmic_settings_are_refused_before_any_file_is_read(tmp_dir):
+    from tools.analyses.fullsim import cosmics
+    read = []
+    d = _fake_cosmic_files(tmp_dir)
+    base = {"n_generated": 20000, "stopped_muons_per_pot": 7.67e-4}
+    with _patched(fs_sens, read_eventntuple=lambda path, triggers: read.append(path)):
+        for params, needle in (
+                ({"cosmic_source": f"{tmp_dir}/missing/*.root"}, "holds no .root"),
+                ({"cosmic_source": f"{tmp_dir}/missing.root"}, "does not exist"),
+                ({"cosmic_source": "auto"}, "not all SAM file names"),
+                ({"cosmic_rate_per_s_per_mev": 1e-6}, "only with cosmic_source 'rate'"),
+                ({"cosmic_source": str(d), "cosmic_livetime_s": 100.0,
+                  "cosmic_max_files": 2}, "cosmic_max_files"),
+                ({"cosmic_shape": "smooth"}, "cosmic_shape")):
+            r = run_analysis(analysis="fullsim_sensitivity", data_file=str(d / "nts.a.root"),
+                             output_dir=tmp_dir, parameters={**base, **params})
+            assert r.status == "error" and needle in r.message, (params, r.message)
+    assert read == []
+    # a rate with 'rate', and the default rate with a measurement, are fine
+    fs_sens.check_cosmic_source({"cosmic_source": "rate", "cosmic_rate_per_s_per_mev": 1e-6},
+                                [])
+    fs_sens.check_cosmic_source(
+        {"cosmic_source": str(d), "cosmic_shape": "flat", "cosmic_max_files": 0,
+         "cosmic_rate_per_s_per_mev": fs_sens.COSMIC_RATE_PER_SECOND_PER_MEV,
+         "cosmic_livetime_s": 100.0}, [])
+    try:
+        fs_sens.check_cosmic_source({"cosmic_source": "auto", "cosmic_shape": "flat",
+                                     "cosmic_max_files": 0, "cosmic_rate_per_s_per_mev": 0.0},
+                                    [CE_MIX_NAME])
+    except cosmics.CosmicError as exc:
+        assert "'rate'" in str(exc)
+    else:
+        raise AssertionError("a rate of 0 with a measured source was accepted")
 
 
 def test_fullsim_cosmic_source_takes_nts_paths(tmp_dir):
@@ -3549,6 +3735,16 @@ def test_fullsim_cosmic_source_takes_nts_paths(tmp_dir):
     assert [p.name for p in cosmics.cosmic_paths(f"{d}/nts.[ab].root")] == names[:2]
     assert [p.name for p in cosmics.cosmic_paths(
         f"{d / names[2]}, {d / names[0]},{d / names[0]}")] == [names[0], names[2]]
+    # the same file name in two places would be read twice, counted once
+    copy = Path(tmp_dir) / "copy"
+    copy.mkdir()
+    (copy / names[0]).write_bytes(b"")
+    try:
+        cosmics.cosmic_paths(f"{d},{copy}")
+    except cosmics.CosmicError as exc:
+        assert names[0] in str(exc) and "more than once" in str(exc), exc
+    else:
+        raise AssertionError("a repeated file name was accepted")
     for bad, needle in ((f"{d}/missing.root", "does not exist"),
                         (f"{tmp_dir}/empty", "no .root"), (f"{d}/notes.txt", "no .root")):
         try:
@@ -3559,7 +3755,7 @@ def test_fullsim_cosmic_source_takes_nts_paths(tmp_dir):
             raise AssertionError(f"no error for {bad}")
 
     # measure_cosmics on them: SAM unknown -> pointed at cosmic_livetime_s;
-    # given, it is the livetime, and cosmic_max_files cuts the files
+    # given, it is the livetime of them all
     from tools.analyses.fullsim.eventntuple import ORIGIN_COSMIC
     from tools.analyses.fullsim.provenance import ProvenanceError
     ev = {"origin": np.full(4, ORIGIN_COSMIC), "t": np.full(4, 900.0),
@@ -3575,7 +3771,7 @@ def test_fullsim_cosmic_source_takes_nts_paths(tmp_dir):
         setattr(fs_sens, k, v)
     try:
         params = {"cosmic_source": str(d), "cosmic_shape": "flat",
-                  "cosmic_max_files": 2, "cosmic_livetime_per_event": 0.0,
+                  "cosmic_max_files": 0, "cosmic_livetime_per_event": 0.0,
                   "cosmic_livetime_s": 0.0}
         args = (["nts.mu2e.CeMLeadingLogMix1BB.x.root"], [], (), (640.0, 1650.0),
                 100.0, 0.0, 0.0, fs_cuts.CUT_SET)
@@ -3586,9 +3782,11 @@ def test_fullsim_cosmic_source_takes_nts_paths(tmp_dir):
         else:
             raise AssertionError("no error without SAM or cosmic_livetime_s")
         cosmic = fs_sens.measure_cosmics({**params, "cosmic_livetime_s": 1000.0}, *args)
-        assert cosmic["n_files"] == 2 and cosmic["livetime"] == 1000.0
+        assert cosmic["n_files"] == 3 and cosmic["livetime"] == 1000.0
+        assert cosmic["files"] == names
         assert cosmic["weight"] == 0.1 and cosmic["s2_events"] is None
         assert cosmic["n_flat_range"] == 3 and cosmic["dataset"] == str(d)
+        assert not cosmic["upper_limit"]
         lines = fs_sens.cosmic_log_lines(cosmic, 1.0, {"onspill_seconds": 100.0,
                                                        "cosmic_rate_per_mev": 0.0})
         assert any("cosmic_livetime_s" in line for line in lines)
@@ -6746,7 +6944,7 @@ def test_fullsim_cosmic_rows_keep_cosmics_in_range_and_time_weighted_by_livetime
     rows, per_mev = fs_tune.cosmic_rows(tracks, (540.0, 1650.0), 300.0, 2000.0)
     # on-spill time over livetime, spread flat over 100-110 MeV/c
     assert np.isclose(per_mev, 300.0 / 2000.0 / 10.0)
-    want = ((origin == FS_ORIGIN_COSMIC) & (tracks["p"] > 100) & (tracks["p"] < 110)
+    want = ((origin == FS_ORIGIN_COSMIC) & (tracks["p"] >= 100) & (tracks["p"] < 110)
             & (tracks["t0"] > 540) & (tracks["t0"] < 1650) & np.isfinite(tracks["t0err"]))
     assert rows["p"].size == int(want.sum()) > 0
     assert (rows["origin"] == FS_ORIGIN_COSMIC).all()
@@ -6786,7 +6984,8 @@ def test_fullsim_optimize_mode_runs_and_fixed_mode_reports_minus_one(tmp_dir):
              presel=None):
         seen["presel"] = presel
         lt = fake.livetime
-        return {"dataset": "toy.cosmics", "n_files": 1, "s1_file": "s1.art",
+        return {"dataset": "toy.cosmics", "n_files": 1, "files": ["toy.root"],
+                "s1_file": "s1.art",
                 "livetime_per_event": 1.0, "s2_events": lt, "livetime": lt,
                 "weight": onspill / lt, "n_counted": 5, "n_flat_range": 5,
                 "upper_limit": 0.0, "shape": "flat",

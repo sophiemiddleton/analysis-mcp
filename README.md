@@ -1250,26 +1250,33 @@ mixed with pileup: CeMLeadingLogMix1BB EventNtuple files, e.g.
    `sim.mu2e.CosmicDSStopsCRYAll.MDC2025ab`, 0.27% rms over 318 subruns;
    `cosmic_livetime_per_event` overrides it). The livetime stored in the
    files is not used: `Mu2eProductMixer::endSubRun` truncates it with an
-   integer division (zero or up to ~25% low), and EventNtuple keeps none.
+   integer division (zero or up to ~25% low, for samples made before
+   Offline `52ff4a0d`, 2026-08-24), and EventNtuple keeps none.
    The 500 MDC2025au files hold 5.7e6 s, about 54 times the on-spill time
    of 1e18 POT; `cosmic_max_files` reads only the first ones (~6 s each).
    With the default cuts, 272 cosmic tracks pass in 100-110 MeV/c inside
    540-1650 ns: 4.76e-6 per s per MeV/c (6% statistical), 2.7 times below
    the flat Run-1A rate, so 0.71 cosmics instead of 1.90 in the best window
    for 1e18 POT (`fullsim/README.md` has the full run).
-   `cosmic_shape` `flat` (default) spreads the count in 100-110 MeV/c
-   evenly per MeV/c (or the 90% CL limit of 2.3 events when there is none),
-   since the window scan would otherwise chase the gaps between single
-   events; `measured` bins them as they are. `cosmic_source` `rate` keeps
+   `cosmic_shape` `flat` (default) spreads the count in [100, 110) MeV/c
+   evenly per MeV/c, never below the 90% CL limit for none seen (2.303
+   events, so one or two tracks score it too and a track seen never lowers
+   the rate), since the window scan would otherwise chase the gaps between
+   single events; `measured` bins them as they are. `cosmic_source` `rate` keeps
    the old model, flat at `cosmic_rate_per_s_per_mev` over the on-spill
    time, as `approx_ce_sensitivity` has it; a SAM dataset name measures on
    that sample; a path (anything with a `/`: comma-separated `.root` files,
    directories or globs) measures on EventNtuple files on disk. Their
    livetime still comes from SAM by file name (copies of official files
-   work as they are); for files SAM does not know, give it as
-   `cosmic_livetime_s`, which also overrides the SAM livetime of any
-   sample. The cosmic files take the same `cut_set`, thresholds and
-   time window as the CE. This is the fixed-cut result; `cut_mode`
+   work as they are, but a file name may appear only once); for files SAM
+   does not know, give it as `cosmic_livetime_s`, which also overrides the
+   SAM livetime of any sample and cannot be combined with
+   `cosmic_max_files`. `cosmic_rate_per_s_per_mev` is refused unless at
+   its default when the cosmics are measured. Settings that cannot work
+   (a missing path, an `auto` with inputs it cannot match) are refused
+   before any file is read. The files read are listed in
+   `cosmic_sample.files`. The cosmic files take the same `cut_set`,
+   thresholds and time window as the CE. This is the fixed-cut result; `cut_mode`
    `optimize` tunes against the same cosmic mix's tracks, read in the same
    pass and weighted the same way (`opt_cosmic_livetime_s`), so it needs
    the mix (`cosmic_source` not `rate`).
@@ -1284,7 +1291,8 @@ MeV/c of on-spill time, unless `cosmic_source` is `rate`) behind them. The
 cosmic sample: `cosmic_livetime_s`, `cosmic_weight` (run events per cosmic
 event), `n_cosmic_files`, `n_cosmic_events`, `n_cosmic_counted` (in the
 time window, any momentum), `n_cosmic_flat_range` (in 100-110 MeV/c) and
-`cosmic_upper_limit` (1 when the limit was used); all -1 with `rate`. Also
+`cosmic_upper_limit` (1 when fewer than 2.303 were seen, so the limit was
+scored); all -1 with `rate`. Also
 `signal_efficiency` (overall) and `signal_efficiency_window`,
 `n_signal_window` (reconstructed CE in the window), and the event counts.
 Outputs: `fullsim_sensitivity.log` (with the top windows scanned),
@@ -1293,11 +1301,15 @@ response, and momentum vs time.
 
 On `nts.mu2e.CeMLeadingLogMix1BB.MDC2025au_best_v1_1-001.001430_00000000.root`
 (20000 generated, 8212 reaching the ntuple: acceptance 0.41; about 6 s),
-3010 CE pass the cuts and the time window: efficiency 0.15. For 1e18 POT
-(7.67e14 stopped mu-, 46.7 conversions at R_mue = 1e-13) the best window is
-[103.5, 104.7] MeV/c with S = 4.69, cosmics 1.90 and DIO 0.0009: with
-stopped muons per POT in, the DIO is negligible and the cosmics set the
-window. `tests/test_tools.py` locks this in.
+3595 CE pass the `run1a_tsda` cuts in 540-1650 ns: efficiency 0.18. For
+1e18 POT (7.67e14 stopped mu-, 46.7 conversions at R_mue = 1e-13) the best
+window is [103.5, 104.7] MeV/c with S = 5.62, DIO 0.0011 and, with
+`cosmic_source` `rate`, cosmics 1.90: S/sqrt(B) = 4.07. With the first
+three files of the cosmic mix (`cosmic_max_files` 3; 3.4e4 s of cosmics),
+2 cosmic tracks pass in 100-110 MeV/c, so the 2.303 floor is scored:
+cosmics 0.995, S/sqrt(B) = 5.63. With stopped muons per POT in, the DIO is
+negligible and the cosmics set the window. `tests/test_tools.py` locks
+both in.
 
 Unlike `approx_ce_sensitivity`, whose normalization is its macro's (signal
 NPOT x BR and DIO NPOT x (1 - capture fraction), with no stopped muons per
@@ -1695,9 +1707,11 @@ goes to `mu2e`, art resolves it on `FHICL_FILE_PATH`, `fcl_exists` comes back
 python3 tests/test_tools.py
 ```
 
-352 tests, none of which start a mu2e job. Only one reaches SAM:
+355 tests, none of which start a mu2e job. Only one reaches SAM:
 `test_fullsim_measures_cosmics_on_the_cosmic_mix`, which needs the cosmic
-livetime from `dh.gencount`, and skips without SAM or the files on disk;
+livetime from `dh.gencount`; it skips only when SAM or metacat cannot be
+reached or the files are not on disk or staged, and any other failure
+fails it;
 the others use fakes (the catalog tests) or pass the numbers SAM would give. (The `ana` env has no pytest, so
 these are bare asserts.)
 

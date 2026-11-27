@@ -88,6 +88,11 @@ class CatalogError(ValueError):
     """An input could not be resolved, worded for the caller."""
 
 
+class NoSuchDataset(CatalogError):
+    """No catalog knows the dataset: unlike other CatalogErrors (a network
+    failure, say), a definite answer a caller may fall back on."""
+
+
 def is_catalog_name(entry: str) -> bool:
     """True for a file named by the catalog rather than by path: no '/'."""
     return "/" not in entry
@@ -278,7 +283,7 @@ def dataset_file_names(dataset: str, client: Catalogs) -> tuple[list[str], str]:
         raise CatalogError(
             f"cannot list dataset {dataset} ({network_problem(exc)}); SAM and metacat are read "
             "over HTTPS, so check this node can reach them") from None
-    raise CatalogError(f"no such dataset: tried {' and '.join(tried)}")
+    raise NoSuchDataset(f"no such dataset: tried {' and '.join(tried)}")
 
 
 def locate_files(names: list[str], client: Catalogs) -> tuple[list[Path], list[str]]:

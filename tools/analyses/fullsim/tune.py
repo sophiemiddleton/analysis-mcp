@@ -225,13 +225,13 @@ def cosmic_rows(tracks: dict, time_window, onspill_seconds: float,
     made, in the time window and the flat range, and the weight each carries
     per MeV/c of window: (on-spill time / the sample's livetime), spread
     flat over the range. Every species is kept: the tuned cuts must still
-    reject the muons (about a third), TrkPID above all, and rows without
+    reject the muons, TrkPID above all, and rows without
     them let the search drop that cut for free."""
     if livetime_s <= 0:
         raise TuneError(f"the cosmic sample's livetime is {livetime_s:g} s")
     p = tracks["p"]
     keep = ((tracks["origin"] == ORIGIN_COSMIC) & np.isfinite(p)
-            & (p > COSMIC_FLAT_MEV[0]) & (p < COSMIC_FLAT_MEV[1]))
+            & (p >= COSMIC_FLAT_MEV[0]) & (p < COSMIC_FLAT_MEV[1]))
     for name in VARIABLE_NAMES:
         keep &= np.isfinite(tracks[name])
     rows = in_time({k: v[keep] for k, v in tracks.items()}, time_window)
