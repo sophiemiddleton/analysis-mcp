@@ -332,7 +332,9 @@ def _optimize_lines(result, extra) -> list[str]:
         + "), the time window {:g}-{:g} ns (fixed)".format(*extra["time_window"])
         + " and cuts tuned on the Punzi FoM, chosen on even events, reported on odd",
         f"  cosmics: {cs['n_rows']} tracks of {cs['dataset']} ({cs['n_files']} files, "
-        f"CRY livetime {cs['livetime_s']:.4g} s from {cs['s2_events']:.4g} S2 events)",
+        f"CRY livetime {cs['livetime_s']:.4g} s"
+        + (" given)" if cs["s2_events"] is None
+           else f" from {cs['s2_events']:.4g} S2 events)"),
         "  seed:  [{:.1f}, {:.1f}] MeV/c, ".format(*result.window_mev(result.seed_window))
         + cut_text(result.seed_cuts),
         f"         Punzi train {result.seed_train.fom:.4g}, test {result.seed_test.fom:.4g} "
@@ -385,18 +387,37 @@ def measure_cosmics(params: dict, input_names: list[str], active: list[str],
         raise cosmics.CosmicError(
             f"cosmic_shape {shape!r} must be '{cosmics.SHAPE_FLAT}' or "
             f"'{cosmics.SHAPE_MEASURED}'")
-    dataset = find_cosmic_dataset(source, input_names)
     max_files = int(params["cosmic_max_files"]) or None
-    paths = resolve_inputs(dataset=dataset, max_files=max_files).paths
+    if cosmics.is_path_source(source):
+        # nts files on disk: the sample is named by the paths given
+        dataset = source
+        paths = cosmics.cosmic_paths(source)[:max_files]
+    else:
+        dataset = find_cosmic_dataset(source, input_names)
+        paths = resolve_inputs(dataset=dataset, max_files=max_files).paths
     names = [path.name for path in paths]
     if set(names) & set(input_names):
         raise cosmics.CosmicError(
             f"the cosmic sample {dataset} shares files with the inputs; the "
             "inputs must be the CE mix")
-    s1_file = root_ancestor(names[0])
-    tau = params["cosmic_livetime_per_event"] or cosmics.livetime_per_event(s1_file)
-    s2_events = sum(generated_events_bulk(names).values())
-    livetime = s2_events * tau
+    s1_file, tau, s2_events = None, None, None
+    livetime = params.get("cosmic_livetime_s", 0.0)
+    if livetime <= 0:
+        try:
+            s1_file = root_ancestor(names[0])
+            tau = (params["cosmic_livetime_per_event"]
+                   or cosmics.livetime_per_event(s1_file))
+            s2_events = sum(generated_events_bulk(names).values())
+        except ProvenanceError as exc:
+            if not cosmics.is_path_source(source):
+                raise
+            # files SAM may never have seen: say how to do without it
+            raise cosmics.CosmicError(
+                f"the cosmic livetime of the files in cosmic_source comes from "
+                f"SAM by file name, and {exc}. For files SAM does not know, "
+                "pass their total cosmic livetime in seconds as "
+                "cosmic_livetime_s") from None
+        livetime = s2_events * tau
     parts, candidates = [], []
     for path in paths:
         data = read_eventntuple(path, triggers)
@@ -446,12 +467,15 @@ def cosmic_log_lines(cosmic: dict | None, rate: float, spectra: dict) -> list[st
     lo, hi = cosmics.COSMIC_FLAT_RANGE
     seen = (f"{cosmics.ZERO_COUNT_UPPER_LIMIT:g} (90% CL limit: none seen)"
             if cosmic["upper_limit"] else str(cosmic["n_flat_range"]))
+    livetime = (f"{cosmic['livetime']:.5g} s (cosmic_livetime_s)"
+                if cosmic["s2_events"] is None else
+                f"{cosmic['s2_events']:.6g} S2 events resampled x "
+                f"{cosmic['livetime_per_event']:.5g} s per S1 event (S1 "
+                f"{cosmic['s1_file']}) = {cosmic['livetime']:.5g} s")
     return [
         f"  cosmic sample    {cosmic['dataset']}, {cosmic['n_files']} files, "
         f"{cosmic['ev']['n_events']} events",
-        f"    livetime       {cosmic['s2_events']:.6g} S2 events resampled x "
-        f"{cosmic['livetime_per_event']:.5g} s per S1 event (S1 "
-        f"{cosmic['s1_file']}) = {cosmic['livetime']:.5g} s",
+        f"    livetime       {livetime}",
         f"    weight         {cosmic['weight']:.4g} per cosmic {onspill}",
         f"    counted        {cosmic['n_counted']} cosmic tracks pass the cuts "
         f"in the time window, {cosmic['n_flat_range']} in {lo:g}-{hi:g} MeV/c",
@@ -934,7 +958,13 @@ SPEC = AnalysisSpec(
                         "events whose first track a cosmic made are counted, "
                         "and each stands for the on-spill time over the "
                         "sample's cosmic livetime. A SAM dataset name measures "
-                        "on that sample instead. 'rate' uses the flat "
+                        "on that sample instead, and a path (anything with a "
+                        "'/') on EventNtuple files on disk: comma-separated "
+                        ".root files, directories (their *.root) or globs, "
+                        "e.g. /exp/mu2e/data/users/me/cosmics/*.root; their "
+                        "livetime comes from SAM by file name, or from "
+                        "cosmic_livetime_s for files SAM does not know. "
+                        "'rate' uses the flat "
                         "cosmic_rate_per_s_per_mev and reads no cosmic files. "
                         "Measuring reads every file of the sample (500 for "
                         "MDC2025au, ~6 s each) unless cosmic_max_files caps it.",
@@ -974,6 +1004,16 @@ SPEC = AnalysisSpec(
                         + "). The livetime stored in resampled cosmic files "
                         "is truncated by a Mu2eProductMixer bug and is not "
                         "used.",
+            default=0.0, minimum=0.0,
+        ),
+        ParamSpec(
+            name="cosmic_livetime_s",
+            description="The total cosmic livetime (s) of the cosmic sample "
+                        "read (after cosmic_max_files), for files whose "
+                        "provenance SAM does not have, e.g. a private cosmic "
+                        "nts given as a path in cosmic_source. 0 (the "
+                        "default) computes it from SAM: S2 events resampled "
+                        "x cosmic_livetime_per_event.",
             default=0.0, minimum=0.0,
         ),
         ParamSpec(

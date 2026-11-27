@@ -3533,6 +3533,70 @@ def test_fullsim_measures_cosmics_on_the_cosmic_mix(tmp_dir):
     assert md["cosmic_upper_limit"] == float(n == 0)
 
 
+def test_fullsim_cosmic_source_takes_nts_paths(tmp_dir):
+    from tools.analyses.fullsim import cosmics
+    d = Path(tmp_dir) / "cos"
+    d.mkdir()
+    names = ["nts.a.root", "nts.b.root", "nts.c.root"]
+    for name in names:
+        (d / name).write_bytes(b"")
+    (d / "notes.txt").write_text("")
+    (Path(tmp_dir) / "empty").mkdir()
+    assert cosmics.is_path_source(str(d)) and not cosmics.is_path_source("auto")
+    assert not cosmics.is_path_source("nts.mu2e.CosmicSignalMix1BB.MDC2025au_best_v1_1-001.root")
+    # a directory, a glob, files (sorted, no repeats)
+    assert [p.name for p in cosmics.cosmic_paths(str(d))] == names
+    assert [p.name for p in cosmics.cosmic_paths(f"{d}/nts.[ab].root")] == names[:2]
+    assert [p.name for p in cosmics.cosmic_paths(
+        f"{d / names[2]}, {d / names[0]},{d / names[0]}")] == [names[0], names[2]]
+    for bad, needle in ((f"{d}/missing.root", "does not exist"),
+                        (f"{tmp_dir}/empty", "no .root"), (f"{d}/notes.txt", "no .root")):
+        try:
+            cosmics.cosmic_paths(bad)
+        except cosmics.CosmicError as exc:
+            assert needle in str(exc), exc
+        else:
+            raise AssertionError(f"no error for {bad}")
+
+    # measure_cosmics on them: SAM unknown -> pointed at cosmic_livetime_s;
+    # given, it is the livetime, and cosmic_max_files cuts the files
+    from tools.analyses.fullsim.eventntuple import ORIGIN_COSMIC
+    from tools.analyses.fullsim.provenance import ProvenanceError
+    ev = {"origin": np.full(4, ORIGIN_COSMIC), "t": np.full(4, 900.0),
+          "p": np.array([101.0, 103.0, 105.0, 120.0]), "n_events": 4}
+
+    def no_sam(name, *a, **k):
+        raise ProvenanceError(f"no SAM record for {name}")
+    patched = {"root_ancestor": no_sam, "generated_events_bulk": no_sam,
+               "read_eventntuple": lambda path, triggers: {},
+               "reduce_data": lambda *a: ev, "combine": lambda parts: parts[0]}
+    originals = {k: getattr(fs_sens, k) for k in patched}
+    for k, v in patched.items():
+        setattr(fs_sens, k, v)
+    try:
+        params = {"cosmic_source": str(d), "cosmic_shape": "flat",
+                  "cosmic_max_files": 2, "cosmic_livetime_per_event": 0.0,
+                  "cosmic_livetime_s": 0.0}
+        args = (["nts.mu2e.CeMLeadingLogMix1BB.x.root"], [], (), (640.0, 1650.0),
+                100.0, 0.0, 0.0, fs_cuts.CUT_SET)
+        try:
+            fs_sens.measure_cosmics(params, *args)
+        except cosmics.CosmicError as exc:
+            assert "cosmic_livetime_s" in str(exc), exc
+        else:
+            raise AssertionError("no error without SAM or cosmic_livetime_s")
+        cosmic = fs_sens.measure_cosmics({**params, "cosmic_livetime_s": 1000.0}, *args)
+        assert cosmic["n_files"] == 2 and cosmic["livetime"] == 1000.0
+        assert cosmic["weight"] == 0.1 and cosmic["s2_events"] is None
+        assert cosmic["n_flat_range"] == 3 and cosmic["dataset"] == str(d)
+        lines = fs_sens.cosmic_log_lines(cosmic, 1.0, {"onspill_seconds": 100.0,
+                                                       "cosmic_rate_per_mev": 0.0})
+        assert any("cosmic_livetime_s" in line for line in lines)
+    finally:
+        for k, v in originals.items():
+            setattr(fs_sens, k, v)
+
+
 def test_fullsim_a_bad_cosmic_shape_is_refused_before_any_cosmic_is_read():
     from tools.analyses.fullsim import cosmics
     params = {"cosmic_source": "auto", "cosmic_shape": "smooth"}

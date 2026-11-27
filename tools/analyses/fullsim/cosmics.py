@@ -23,6 +23,7 @@ and area), measured once from its subrun products (S1_LIVETIME_PER_EVENT;
 read_s1_livetime does it for a new one).
 """
 
+import glob
 import re
 import struct
 from pathlib import Path
@@ -74,6 +75,40 @@ OBJECT_HEADER = 10
 
 class CosmicError(RuntimeError):
     """The cosmic sample cannot be used, worded for the caller."""
+
+
+def is_path_source(source: str) -> bool:
+    """Whether cosmic_source names files on disk rather than a dataset:
+    a path has a '/', which no SAM dataset name does."""
+    return "/" in source
+
+
+def cosmic_paths(source: str) -> list[Path]:
+    """The EventNtuple files cosmic_source names on disk: comma-separated
+    entries, each a .root file, a directory (its *.root files) or a glob;
+    sorted by name and without repeats, as a dataset's files are."""
+    paths: set[Path] = set()
+    for entry in (e.strip() for e in source.split(",")):
+        if not entry:
+            continue
+        path = Path(entry).expanduser()
+        if glob.has_magic(entry):
+            found = [Path(p) for p in glob.glob(str(path))]
+        elif path.is_dir():
+            found = list(path.glob("*.root"))
+        elif path.is_file():
+            found = [path]
+        else:
+            raise CosmicError(f"cosmic_source names {entry}, which does not exist")
+        found = [p for p in found if p.suffix == ".root" and p.is_file()]
+        if not found:
+            raise CosmicError(
+                f"cosmic_source names {entry}, which holds no .root files; it "
+                "takes EventNtuple (nts) files, directories or globs of them")
+        paths.update(found)
+    if not paths:
+        raise CosmicError("cosmic_source names no files")
+    return sorted(paths, key=lambda p: (p.name, str(p)))
 
 
 def cosmic_datasets_for(input_names: list[str]) -> list[str]:

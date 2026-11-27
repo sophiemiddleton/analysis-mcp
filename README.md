@@ -1263,7 +1263,12 @@ mixed with pileup: CeMLeadingLogMix1BB EventNtuple files, e.g.
    events; `measured` bins them as they are. `cosmic_source` `rate` keeps
    the old model, flat at `cosmic_rate_per_s_per_mev` over the on-spill
    time, as `approx_ce_sensitivity` has it; a SAM dataset name measures on
-   that sample. The cosmic files take the same `cut_set`, thresholds and
+   that sample; a path (anything with a `/`: comma-separated `.root` files,
+   directories or globs) measures on EventNtuple files on disk. Their
+   livetime still comes from SAM by file name (copies of official files
+   work as they are); for files SAM does not know, give it as
+   `cosmic_livetime_s`, which also overrides the SAM livetime of any
+   sample. The cosmic files take the same `cut_set`, thresholds and
    time window as the CE. This is the fixed-cut result; `cut_mode`
    `optimize` tunes against the same cosmic mix's tracks, read in the same
    pass and weighted the same way (`opt_cosmic_livetime_s`), so it needs
@@ -1690,7 +1695,7 @@ goes to `mu2e`, art resolves it on `FHICL_FILE_PATH`, `fcl_exists` comes back
 python3 tests/test_tools.py
 ```
 
-351 tests, none of which start a mu2e job. Only one reaches SAM:
+352 tests, none of which start a mu2e job. Only one reaches SAM:
 `test_fullsim_measures_cosmics_on_the_cosmic_mix`, which needs the cosmic
 livetime from `dh.gencount`, and skips without SAM or the files on disk;
 the others use fakes (the catalog tests) or pass the numbers SAM would give. (The `ana` env has no pytest, so
